@@ -93,7 +93,7 @@ Each fired rule produces an explanation with a severity label (`positive`, `info
 | Local Server | XAMPP |
 | Tunnelling (dev) | ngrok |
 | Version Control | Git |
-| IDE | Visual Studio Code (Kiro AI) |
+| IDE | Visual Studio Code |
 
 ---
 
