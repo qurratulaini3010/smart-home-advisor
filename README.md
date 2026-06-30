@@ -1,281 +1,187 @@
-# smart-home-advisor
-# Smart Home Advisor System
+# Smart Home Advisor
 
-> An expert system that recommends smart home properties in Malaysia based on a user's financial profile, household needs, and smart home preferences — powered by a CLIPS-style forward-chaining inference engine built in PHP.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Features](#features)
-- [System Architecture](#system-architecture)
-- [Inference Engine](#inference-engine)
-- [Tech Stack](#tech-stack)
-- [Database Schema](#database-schema)
-- [Getting Started](#getting-started)
-- [Project Structure](#project-structure)
-- [Scoring Criteria](#scoring-criteria)
-- [User Roles](#user-roles)
-- [Academic Context](#academic-context)
+A PHP web application that helps property buyers find homes that match their financial situation, lifestyle, and smart-home preferences. Buyers fill out a short assessment (budget, income, household size, occupation, smart-home priorities), and the system scores every property in the catalogue against that profile, explaining each score with plain-language rule-based badges.
 
 ---
 
-## Overview
+## 1. System Overview
 
-Smart Home Advisor is a full-stack web-based expert system developed for the ISP543 course. It guides users through a structured assessment — collecting their budget, income, household size, occupation, and smart home feature preferences — and then evaluates a property dataset against 106 inference rules across 8 domains to produce ranked, explainable property recommendations.
+### What it does
 
-The system is designed around Malaysian property data, with timezone and currency (RM) set accordingly.
+A logged-in user completes an **assessment** (income, commitments, budget, household size, occupation, and which smart-home features they care about). The system then:
+
+1. **Scores every property** against that assessment on five weighted dimensions — affordability, security, smart-home readiness, environment/sustainability, and family suitability — producing a single match percentage per property.
+2. **Explains the score** using a separate rules engine that fires plain-language badges ("Within your budget," "High flood risk — factor in insurance," "Hospital nearby — important for retirees") so the user understands *why* a property scored the way it did, not just the number.
+3. Lets the user **browse, filter, and shortlist** properties in a directory view, and lets staff/admin manage the property catalogue.
+
+### Architecture at a glance
+
+The app is plain PHP (no framework) following a light MVC-style split:
+
+| Layer | Location | Responsibility |
+|---|---|---|
+| Entry point | `public/index.php` | Single front controller. Routes via `?page=` query string (no URL rewriting required), renders all pages inline. |
+| API endpoints | `public/api/*.php` | JSON endpoints called by the frontend JS (`properties.php`, `property-directory.php`, `rules.php`). |
+| Core services | `app/core/` | `Auth.php` (session-based login), `Database.php` (PDO/MySQL singleton connection), `Csrf.php` (CSRF token handling). |
+| Business logic | `app/models/` | `RecommendationEngine.php` (the weighted scoring algorithm), `PropertyRepository.php` / `PropertyDirectoryRepository.php` (property queries/filtering). |
+| Frontend | `public/assets/` | Vanilla JS (no build step) + Bootstrap 5 for styling, loaded via CDN. |
+| Database | `database/` | Schema, migrations, and one-off import/seed scripts (run manually, not by the web app). |
+
+### The two engines that drive recommendations
+
+This system has **two separate but related decision-making components**, both keyed off the same user assessment and property data:
+
+- **`RecommendationEngine::score()`** (`app/models/RecommendationEngine.php`) — produces the numeric match percentage (0–100) per property, using fixed weights across five dimensions (affordability 30%, security 20%, smart-home 20%, environment 15%, family 15%).
+- **`buildRules()` / `evaluateRules()`** (`public/api/rules.php`) — a ~108-rule forward-chaining rules engine ("CLIPS-style") that fires explanatory badges (positive / info / warning) per property, grouped into 8 domains (Affordability, Safety, Family, Smart Home, Occupation, etc.).
+
+Both pull occupation classification from a single shared, mutually-exclusive classifier (`RecommendationEngine::classifyOccupation()`) so a user's job title (e.g. "Retired Civil Servant") is always categorized the same way in both the score and the badges.
+
+### Known orphaned code (not wired into the live app)
+
+Two groups of files exist in the codebase but are not currently reachable from any page, button, or script — they were either superseded or never finished. They're harmless to leave in place, but worth knowing about if you're exploring the codebase:
+
+- **Insights feature**: `database/schema_insights.sql`, `database/import_excel.php`, `public/api/insights.php` — a self-contained analytics table/API with no frontend consumer.
+- **Property components prototype**: `public/components/customer-property-cards.html`, `public/components/staff-property-table.html`, `public/assets/js/property-components.js` — an earlier draft of the property directory UI, superseded by `public/partials/property_directory_tabs.php` + `public/assets/js/property-advisor.js`, which is what the live app actually uses.
 
 ---
 
-## Features
+## 2. Setup on a New Laptop
 
-- **User Authentication** — Secure login, session management with 30-minute timeout, and CSRF protection
-- **Smart Assessment Form** — Collects age, income, budget, household size, preferred location, property type, and smart home priorities (lighting, security, appliances, energy)
-- **Rule-Based Inference Engine** — 106 CLIPS-style forward-chaining rules across 8 domains evaluate every property in the database against the user's profile
-- **Weighted Scoring Model** — Each property receives a composite match percentage based on five weighted criteria
-- **Occupation-Aware Recommendations** — Scoring adjusts dynamically based on whether the user is a government employee, self-employed, high-income professional, student, or retiree
-- **Property Directory** — Browseable and filterable list of all properties with detailed scores
-- **Favourites** — Users can save and revisit preferred properties
-- **Admin Dashboard** — Staff can manage users, properties, and view system-wide assessment statistics
-- **Explanation Engine** — Each recommendation is accompanied by labelled rule explanations (positive, info, warning) so users understand why a property was recommended
+### Requirements
 
----
+- **PHP 8.1 or newer** (the code uses the `never` return type, which requires 8.1+), with the **`pdo_mysql`** extension enabled.
+  - On Debian/Ubuntu, installing `php-cli` alone does **not** include this — you also need `php-mysql` (`sudo apt install php-cli php-mysql`), confirmed by testing: a fresh `php-cli`-only install fails the import script with `could not find driver`.
+- **MySQL** (or MariaDB) 5.7+/10.3+
+- A local web server — either PHP's built-in server (good enough for development, no extra install needed) or Apache/Nginx with PHP-FPM
+- No `npm`/`composer` install step — there is no `package.json` or `composer.json`. All frontend libraries (Bootstrap 5.3.3, Font Awesome, Chart.js, Google Fonts) load from public CDNs, so **an internet connection is required for the styling/UI to render correctly**, even though all backend logic runs locally.
 
-## System Architecture
+### Step 1 — Get the code
 
-The system follows a Single Page Application (SPA) pattern with a single `public/index.php` entry point that routes views based on the `page` query parameter. There is no JavaScript framework — all routing and rendering is server-side PHP.
+Copy or extract the project folder. The app's own config (`app/config.php`) builds its base URL assuming the folder is named exactly:
 
 ```
-Browser Request
-      │
-      ▼
-public/index.php  (routing + session + auth check)
-      │
-      ├── Auth::check()           (session validation)
-      ├── Database::connect()     (singleton PDO → MySQL)
-      ├── RecommendationEngine    (weighted scoring)
-      └── rules.php API           (106-rule inference engine)
+smart-home-advisor-system
 ```
 
----
+with `public/` as the web root inside it. If you use a different folder name, you'll need to update `APP_URL` in `app/config.php` (see Step 4) to match.
 
-## Inference Engine
+### Step 2 — Create the database
 
-The inference engine in `public/api/rules.php` implements a CLIPS-style forward-chaining approach. Rules are defined as data — each rule is a tuple of `[id, domain, condition, label, severity, explanation]` — and the engine evaluates all rules against a property at query time.
+Open a MySQL client (MySQL Workbench, phpMyAdmin, Adminer, or the `mysql` CLI) and create the database and base schema:
 
-### 8 Rule Domains
-
-| Domain | Rules | Code Range |
-|--------|-------|------------|
-| Affordability | 16 | A01–A16 |
-| Safety & Risk | 14 | S01–S14 |
-| Family Suitability | 16 | F01–F16 |
-| Smart Home Readiness | 18 | H01–H18 |
-| Space & Physical Suitability | 10 | P01–P10 |
-| Investment Value | 14 | I01–I14 |
-| Location Quality | 6 | L01–L06 |
-| Occupation Suitability | 12 | O01–O12 |
-
-Each fired rule produces an explanation with a severity label (`positive`, `info`, or `warning`) that is returned to the frontend and displayed alongside the recommendation result.
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Backend Language | PHP 8 (strict types, OOP) |
-| Database | MySQL 8 (utf8mb4) |
-| Frontend | HTML5, CSS3, JavaScript (ES6+) |
-| DB Access | PDO with prepared statements |
-| Local Server | XAMPP |
-| Tunnelling (dev) | ngrok |
-| Version Control | Git |
-| IDE | Visual Studio Code |
-
----
-
-## Database Schema
-
-Six core tables power the system:
-
-| Table | Purpose |
-|-------|---------|
-| `users` | User accounts with roles (`admin` / `user`) |
-| `properties` | Property listings with all score and proximity columns |
-| `assessments` | Stored user assessment inputs |
-| `recommendations` | Scored and ranked results per assessment |
-| `favorites` | User-saved properties |
-| `smart_home_features` | Smart features linked to each property |
-| `assessment_criteria` | Configurable weights for the scoring model |
-
-The `properties` table includes the following computed/dataset fields relevant to scoring: `smart_readiness_score`, `security_score`, `sustainability_score`, `family_score`, `acoustic_score`, `safety_score`, `crime_risk`, `flood_risk`, `distance_to_public_transport_km`, `distance_to_mall_km`, `distance_to_school_km`, `distance_to_hospital_km`, `estimated_rental_yield_pct`, and `historical_capital_appreciation_3yr_pct`.
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- PHP 8.0 or higher
-- MySQL 8.0
-- XAMPP (or any local Apache/PHP/MySQL stack)
-
-### Installation
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/your-username/smart-home-advisor-system.git
-   ```
-
-2. **Move to your server root**
-   ```bash
-   # For XAMPP on Windows
-   mv smart-home-advisor-system C:/xampp/htdocs/
-
-   # For XAMPP on macOS
-   mv smart-home-advisor-system /Applications/XAMPP/htdocs/
-   ```
-
-3. **Create the database**
-
-   Open phpMyAdmin or your MySQL client and run the schema file:
-   ```sql
-   SOURCE /path/to/smart-home-advisor-system/database/schema.sql;
-   ```
-
-4. **Import the extended properties table** (if using the full dataset)
-   ```sql
-   SOURCE /path/to/smart-home-advisor-system/database/properties_table.sql;
-   ```
-
-5. **Import property data** (optional CSV dataset)
-   ```bash
-   php database/import_properties.php
-   ```
-
-6. **Seed an admin account**
-   ```bash
-   php database/seed_admin.php
-   ```
-
-7. **Configure the app**
-
-   Open `app/config.php` and verify your database credentials:
-   ```php
-   define('DB_HOST', '127.0.0.1');
-   define('DB_NAME', 'smart_home_advisor');
-   define('DB_USER', 'root');
-   define('DB_PASS', '');
-   ```
-
-8. **Start XAMPP** and visit:
-   ```
-   http://localhost/smart-home-advisor-system/public/
-   ```
-
----
-
-## Project Structure
-
-```
-smart-home-advisor-system/
-│
-├── app/
-│   ├── config.php                  # App config, DB credentials, timezone
-│   ├── core/
-│   │   ├── Auth.php                # Session auth, login/logout, role guards
-│   │   ├── Csrf.php                # CSRF token generation and validation
-│   │   └── Database.php            # Singleton PDO connection
-│   ├── helpers/
-│   │   └── helpers.php             # Utility functions (route, redirect, flash, money)
-│   └── models/
-│       ├── RecommendationEngine.php    # Weighted scoring model
-│       ├── PropertyRepository.php      # Property DB queries
-│       └── PropertyDirectoryRepository.php  # Directory listing queries
-│
-├── database/
-│   ├── schema.sql                  # Core schema (all 6 tables + seed data)
-│   ├── properties_table.sql        # Extended properties table schema
-│   ├── migrate_properties_dataset.sql
-│   ├── schema_insights.sql
-│   ├── property_data.csv           # Source property dataset
-│   ├── import_properties.php       # CSV import script
-│   ├── import_excel.php
-│   └── seed_admin.php              # Admin account seeder
-│
-└── public/
-    ├── index.php                   # SPA entry point and view router (1149 lines)
-    ├── .htaccess                   # DirectoryIndex config
-    ├── api/
-    │   ├── rules.php               # 106-rule forward-chaining inference engine
-    │   ├── properties.php          # Property listing API
-    │   ├── property-directory.php  # Directory API
-    │   └── insights.php            # Insights API
-    ├── assets/
-    │   ├── css/
-    │   │   ├── app.css
-    │   │   └── property-advisor.css
-    │   └── js/
-    │       ├── app.js
-    │       ├── property-advisor.js
-    │       └── property-components.js
-    ├── components/
-    │   ├── customer-property-cards.html
-    │   └── staff-property-table.html
-    └── partials/
-        ├── dashboard_favorites.php
-        └── property_directory_tabs.php
+```bash
+mysql -u root -p < database/schema.sql
 ```
 
+This creates the `smart_home_advisor` database and its 7 core tables (`users`, `properties`, `assessment_criteria`, `assessments`, `recommendations`, `favorites`, `smart_home_features`).
+
+> **Note:** `database/properties_table.sql` is a leftover alternate setup script that creates its own competing version of the database/`properties` table. **Don't run it** — use `schema.sql` as the source of truth, followed by the migrations below, which is what the live application's queries actually expect.
+
+### Step 3 — Run the required migration
+
+The base schema already includes `monthly_commitment` and `net_income` on the `assessments` table, but it doesn't yet have all the extra property columns the recommendation/rules engines and the sample property dataset depend on (flood risk, crime risk, safety score, distances to school/hospital/transport, rental yield, etc.). Run this one migration after `schema.sql`:
+
+```bash
+mysql -u root -p smart_home_advisor < database/migrate_properties_dataset.sql
+```
+
+This adds roughly 20 columns to `properties` — without it, the next step (importing the CSV) will fail, since the CSV has columns the base table doesn't have yet.
+
+> **Note on `database/migrate_add_commitment.sql`:** this file is **not needed on a fresh install** — it exists only to upgrade an older database created before `monthly_commitment`/`net_income` were merged into `schema.sql` directly. Running it on a brand-new database will fail with `Duplicate column name 'monthly_commitment'`, since `schema.sql` already created it. Skip it unless you're upgrading an existing, older copy of this database.
+
+### Step 4 — Configure database credentials
+
+Open `app/config.php` and confirm or update these values to match your local MySQL setup:
+
+```php
+define('DB_HOST', '127.0.0.1');
+define('DB_NAME', 'smart_home_advisor');
+define('DB_USER', 'root');
+define('DB_PASS', '');   // set this if your local MySQL root user has a password
+```
+
+There is no `.env` file in this project — all configuration lives directly in this one PHP file. If your folder name isn't `smart-home-advisor-system`, also update the path segment in `APP_URL`:
+
+```php
+define('APP_URL', $protocol . '://' . $host . '/smart-home-advisor-system/public');
+```
+
+### Step 5 — Load the sample property data
+
+The repo includes a real property dataset as a CSV. Load it with the import script:
+
+```bash
+php database/import_properties.php
+```
+
+This reads `database/property_data.csv` and inserts each row into the `properties` table, mapping columns like `Township`, `Median_Price`, `Safety_Score`, `Flood_Risk`, etc.
+
+### Step 6 — Create the admin account
+
+```bash
+php database/seed_admin.php
+```
+
+This creates a default admin login if one doesn't already exist:
+
+```
+Email:    admin@smarthome.local
+Password: Admin@123
+```
+
+**Change this password after first login** if this will be anything other than a local dev environment.
+
+### Step 7 — Start the server
+
+For local development, PHP's built-in server is the quickest option (no Apache/Nginx setup needed) — run this from inside the `public/` folder:
+
+```bash
+cd public
+php -S localhost:8000
+```
+
+Then open `http://localhost:8000` in a browser.
+
+If you'd rather use Apache: point your virtual host's document root at the `public/` folder. The included `public/.htaccess` only sets `DirectoryIndex index.php` — there's no URL rewriting to configure, since the app routes everything through a `?page=` query string.
+
+### Step 8 — Verify it works
+
+1. Visit the homepage — you should see the landing page with Bootstrap styling loaded (if styling looks broken/unstyled, check your internet connection, since CSS/JS load from CDNs).
+2. Log in with the admin credentials from Step 6.
+3. Go to **Assessment**, fill it out, and submit — you should see scored property recommendations with explanatory badges.
+4. Go to **Directory** and confirm properties from the CSV import are listed and filterable.
+
 ---
 
-## Scoring Criteria
+## 3. Running the Logic Tests
 
-The `RecommendationEngine` computes a weighted match score (0–100%) for each property:
+Two standalone PHP test scripts cover the core scoring and rules logic (no database required — they test the pure functions in isolation):
 
-| Criterion | Weight | Description |
-|-----------|--------|-------------|
-| Affordability | 30% | Compares property price against user budget with stretch penalties |
-| Security | 20% | Property security score, boosted if smart security is requested |
-| Smart Readiness | 20% | Smart readiness score + bonus per smart feature requested |
-| Environmental Comfort | 15% | Sustainability score + energy efficiency, hospital proximity for retirees |
-| Family Suitability | 15% | Bedroom fit, household size, location and property type match |
+```bash
+php tests/test_recommendation_engine.php
+php tests/test_rules_engine.php
+```
 
-### Occupation Adjustments
+Place both files in a `tests/` folder at the project root (alongside `app/` and `public/`) and they'll auto-locate the source files; otherwise pass explicit paths:
 
-The engine applies contextual score modifiers based on occupation:
+```bash
+php tests/test_recommendation_engine.php app/models/RecommendationEngine.php
+php tests/test_rules_engine.php public/api/rules.php app/models/RecommendationEngine.php
+```
 
-- **Government / Public Sector** — affordability bonus when price is within budget (stable income)
-- **Self-Employed / Freelance** — affordability penalty when over budget (higher loan rejection risk); bonus for conservative picks
-- **High-Income Professionals** — smart readiness and sustainability score bonuses
-- **Retirees** — hospital proximity scoring applied to environment; safety-based family score boost
+Each script prints a `PASS`/`FAIL` line per check and exits with code `0` if everything passes, `1` if anything fails — safe to wire into a CI step later.
 
 ---
 
-## User Roles
+## 4. Troubleshooting
 
-| Role | Capabilities |
-|------|-------------|
-| `user` | Run assessments, view recommendations, manage favourites, browse property directory |
-| `admin` | All user capabilities + manage properties, view all users, system-wide stats |
-
----
-
-## Academic Context
-
-This project was developed as part of **ISP543 — Expert Systems** at a Malaysian university. It demonstrates the application of expert system concepts including:
-
-- Knowledge acquisition and representation
-- Rule-based inference (forward chaining)
-- Weighted scoring and conflict resolution
-- Explanation generation
-- Expert system architecture (working memory, inference engine, explanation engine)
-
----
-
-## License
-
-This project is developed for academic purposes under ISP543.
+| Symptom | Likely cause |
+|---|---|
+| Blank page / 500 error on load | Check PHP error log; confirm `pdo_mysql` extension is enabled (`php -m \| grep pdo_mysql`) |
+| "SQLSTATE[HY000] Connection refused" | MySQL isn't running, or `DB_HOST`/`DB_USER`/`DB_PASS` in `app/config.php` don't match your local setup |
+| "SQLSTATE[HY000] [1698] Access denied for user 'root'@'localhost'" even though the password is correct | Common with fresh MySQL/MariaDB installs: the `root` user often only has a grant for connections via the local socket (`localhost`), not over TCP — but `app/config.php` connects via `DB_HOST = '127.0.0.1'`, which MySQL treats as a different login. Fix by granting root TCP access: `mysql -u root -e "CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD(''); GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1'; FLUSH PRIVILEGES;"` (adjust the password if you've set one) |
+| Page loads but has no styling | No internet access — Bootstrap/Font Awesome/fonts load from CDNs, not bundled locally |
+| Directory page shows no properties | `database/import_properties.php` wasn't run, or was run before `migrate_properties_dataset.sql` (columns wouldn't exist yet, so the import script fails with a SQL error) |
+| Can't log in as admin | `database/seed_admin.php` wasn't run, or was run before `schema.sql` created the `users` table |
+| Recommendation scores look wrong / missing rule badges | Confirm `migrate_properties_dataset.sql` ran successfully — most scoring/rule logic depends on the columns it adds |
+| `database/migrate_add_commitment.sql` fails with "Duplicate column name 'monthly_commitment'" | Expected on a fresh install — this migration is only for upgrading old databases. Skip it; `schema.sql` already includes these columns |
