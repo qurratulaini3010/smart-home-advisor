@@ -11,6 +11,9 @@ require __DIR__ . '/../../app/config.php';
 require __DIR__ . '/../../app/helpers/helpers.php';
 require __DIR__ . '/../../app/core/Database.php';
 require __DIR__ . '/../../app/core/Auth.php';
+// FIX: Required so rules.php can use RecommendationEngine::classifyOccupation()
+// for canonical, consistent occupation classification.
+require __DIR__ . '/../../app/models/RecommendationEngine.php';
 
 function respond(array $payload, int $status = 200): never
 {
@@ -31,8 +34,13 @@ if (!Auth::check()) {
 function buildRules(float $budget, array $assessment = []): array
 {
     // ── Unpack assessment fields ──────────────────────────────────────────────
-    $age             = (int)   ($assessment['age']              ?? 0);
-    $income          = (float) ($assessment['monthly_income']   ?? 0);
+    $age             = (int)   ($assessment['age']                ?? 0);
+    $income          = (float) ($assessment['monthly_income']     ?? 0);
+    $commitment      = (float) ($assessment['monthly_commitment'] ?? 0);
+    // Gaji bersih: net income after all monthly commitments (car loan, PTPTN, credit card, etc.)
+    // If the DB generated column is available use it; otherwise compute it here.
+    $netIncome       = (float) ($assessment['net_income']
+                        ?? max(0, $income - $commitment));
     $household       = (int)   ($assessment['household_size']   ?? 0);
     $prefLocation    = strtolower(trim((string) ($assessment['preferred_location'] ?? '')));
     $prefType        = strtolower(trim((string) ($assessment['property_type']      ?? 'any')));
@@ -41,41 +49,60 @@ function buildRules(float $budget, array $assessment = []): array
     $wantsAppliances = (int)   ($assessment['smart_appliances'] ?? 0) === 1;
     $wantsEnergy     = (int)   ($assessment['smart_energy']     ?? 0) === 1;
     $smartCount      = (int)$wantsLighting + (int)$wantsSecurity + (int)$wantsAppliances + (int)$wantsEnergy;
-    $comfortPri      = strtolower((string) ($assessment['comfort_priority'] ?? ''));
-    $occupation      = strtolower(trim((string) ($assessment['occupation'] ?? '')));
+    // FIX (audit item #5): comfort_priority is a closed set in practice — the
+    // front end (assets/js/app.js, slidersToAssessmentFields) only ever sends
+    // "Family growth", "Acoustic comfort", or "Energy efficiency"; the quick
+    // assessment form (index.php) only ever sends "Energy efficiency". Treat
+    // it as the enum it actually is instead of matching arbitrary substrings.
+    // This also surfaces a real bug the substring version hid silently: no UI
+    // path can ever send a value containing "security", so the old H14 rule
+    // ("Matches your security comfort priority") was unreachable dead code.
+    // It has been removed below rather than left to silently never fire.
+    $comfortPriorityMap = [
+        'energy efficiency' => 'ENERGY',
+        'acoustic comfort'  => 'ACOUSTIC',
+        'family growth'     => 'FAMILY',
+    ];
+    $comfortPri = strtolower(trim((string) ($assessment['comfort_priority'] ?? '')));
+    $comfortCategory = $comfortPriorityMap[$comfortPri] ?? null; // null = no match, explicit no-op
+    $occupation      = (string) ($assessment['occupation'] ?? '');
 
-    // Occupation category helpers
-    $isGovt      = str_contains($occupation, 'civil') || str_contains($occupation, 'government')
-                   || str_contains($occupation, 'public sector') || str_contains($occupation, 'polis')
-                   || str_contains($occupation, 'army') || str_contains($occupation, 'tentera')
-                   || str_contains($occupation, 'teacher') || str_contains($occupation, 'lecturer')
-                   || str_contains($occupation, 'professor') || str_contains($occupation, 'nurse')
-                   || str_contains($occupation, 'doctor') || str_contains($occupation, 'physician');
-    $isSelfEmployed = str_contains($occupation, 'self') || str_contains($occupation, 'freelance')
-                   || str_contains($occupation, 'business owner') || str_contains($occupation, 'entrepreneur')
-                   || str_contains($occupation, 'contractor') || str_contains($occupation, 'consultant')
-                   || str_contains($occupation, 'trader') || str_contains($occupation, 'hawker');
-    $isHighIncome   = str_contains($occupation, 'engineer') || str_contains($occupation, 'lawyer')
-                   || str_contains($occupation, 'attorney') || str_contains($occupation, 'architect')
-                   || str_contains($occupation, 'surgeon') || str_contains($occupation, 'specialist')
-                   || str_contains($occupation, 'director') || str_contains($occupation, 'manager')
-                   || str_contains($occupation, 'executive') || str_contains($occupation, 'ceo')
-                   || str_contains($occupation, 'accountant') || str_contains($occupation, 'banker')
-                   || str_contains($occupation, 'pilot') || str_contains($occupation, 'pharmacist');
-    $isStudent      = str_contains($occupation, 'student') || str_contains($occupation, 'intern')
-                   || str_contains($occupation, 'graduate') || str_contains($occupation, 'scholar');
-    $isRetired      = str_contains($occupation, 'retire') || str_contains($occupation, 'pensioner')
-                   || str_contains($occupation, 'pension');
+    // FIX: Use the canonical occupation classifier from RecommendationEngine so
+    // that both the numeric scoring engine and the rules badge engine use the
+    // exact same keyword lists. Previously they had slightly different lists
+    // which caused inconsistencies (e.g. 'physician' triggered rules but not scores).
+    $occ            = RecommendationEngine::classifyOccupation($occupation);
+    $isGovt         = $occ['isGovt'];
+    $isSelfEmployed = $occ['isSelfEmployed'];
+    $isHighIncome   = $occ['isHighIncome'];
+    $isStudent      = $occ['isStudent'];
+    $isRetired      = $occ['isRetired'];
 
-    // Helper — mortgage-to-income ratio
-    $mortgageRatio = fn($p) => $income > 0 && (float)($p['est_monthly_mortgage_rm'] ?? 0) > 0
-        ? (float)($p['est_monthly_mortgage_rm'] ?? 0) / $income
+    // ── Key derived ratios ────────────────────────────────────────────────────
+    // Commitment ratio: how much of gross income is already locked in obligations
+    // Higher commitment ratio = less room for mortgage regardless of salary level
+    $commitmentRatio = $income > 0 ? $commitment / $income : 0;
+
+    // Mortgage-to-NET-income ratio — this is what truly determines cash-flow stress.
+    // A high earner (RM 15k) with RM 10k commitments has only RM 5k net;
+    // a moderate earner (RM 5k) with zero commitments has full RM 5k net.
+    // Using gross income alone is misleading — we must use gaji bersih.
+    $mortgageToNetRatio = fn($p) => $netIncome > 0 && (float)($p['est_monthly_mortgage_rm'] ?? 0) > 0
+        ? (float)($p['est_monthly_mortgage_rm'] ?? 0) / $netIncome
+        : 0;
+
+    // Price-to-annual-net-income ratio (uses net income, more realistic than gross)
+    $priceToNetAnnual = fn($p) => $netIncome > 0 && (float)($p['median_price'] ?? $p['price'] ?? 0) > 0
+        ? (float)($p['median_price'] ?? $p['price'] ?? 0) / ($netIncome * 12)
         : 0;
 
     return [
 
         // ════════════════════════════════════════════════════════════
-        // DOMAIN 1: AFFORDABILITY  (A01–A16)
+        // DOMAIN 1: AFFORDABILITY  (A01–A18)
+        // All mortgage stress rules now use NET income (gaji bersih)
+        // because commitments reduce real repayment capacity regardless
+        // of gross salary level.
         // ════════════════════════════════════════════════════════════
 
         ['A01', 'Affordability',
@@ -124,27 +151,31 @@ function buildRules(float $budget, array $assessment = []): array
             'Above-average price per sqft (≥ RM 400)', 'warning',
             'Median PSF is RM 400 or above — premium pricing, ensure value justifies cost.'],
 
+        // A09–A12: Mortgage stress is measured against NET income (gaji bersih),
+        // not gross. A person earning RM 12k with RM 9k in commitments has only
+        // RM 3k free — they are MORE stressed than someone earning RM 4k with
+        // zero commitments. Gross salary alone cannot capture this.
         ['A09', 'Affordability',
-            fn($p) => $mortgageRatio($p) > 0 && $mortgageRatio($p) <= 0.30,
-            'Healthy mortgage-to-income ratio (≤ 30%)', 'positive',
-            'Estimated monthly mortgage is 30% or less of your monthly income — financially comfortable.'],
+            fn($p) => $mortgageToNetRatio($p) > 0 && $mortgageToNetRatio($p) <= 0.30,
+            'Healthy mortgage-to-net-income ratio (≤ 30%)', 'positive',
+            'Estimated mortgage is 30% or less of your net income (after commitments) — financially comfortable.'],
 
         ['A10', 'Affordability',
-            fn($p) => $mortgageRatio($p) > 0.30 && $mortgageRatio($p) <= 0.40,
-            'Mortgage is 30–40% of monthly income', 'info',
-            'Mortgage is between 30–40% of income — manageable but watch other expenses.'],
+            fn($p) => $mortgageToNetRatio($p) > 0.30 && $mortgageToNetRatio($p) <= 0.40,
+            'Mortgage is 30–40% of net income', 'info',
+            'Mortgage is 30–40% of your net income — manageable but leaves limited room for emergencies.'],
 
         ['A11', 'Affordability',
-            fn($p) => $mortgageRatio($p) > 0.40,
-            'Mortgage exceeds 40% of monthly income', 'warning',
-            'High financial stress risk — mortgage may strain monthly cash flow.'],
+            fn($p) => $mortgageToNetRatio($p) > 0.40,
+            'Mortgage exceeds 40% of net income', 'warning',
+            'High cash-flow risk — after existing commitments, the mortgage may strain your monthly budget significantly.'],
 
         ['A12', 'Affordability',
             fn($p) => (float)($p['est_monthly_mortgage_rm'] ?? 0) > 0
-                && $income > 0
-                && (float)($p['est_monthly_mortgage_rm'] ?? 0) <= $income * 0.25,
-            'Very affordable mortgage (≤ 25% of income)', 'positive',
-            'Mortgage is 25% or less of income — very low financial burden.'],
+                && $netIncome > 0
+                && (float)($p['est_monthly_mortgage_rm'] ?? 0) <= $netIncome * 0.25,
+            'Very affordable mortgage (≤ 25% of net income)', 'positive',
+            'Mortgage is 25% or less of your net income (gaji bersih) — very low financial burden.'],
 
         ['A13', 'Affordability',
             fn($p) => $age > 0 && $age >= 50
@@ -152,19 +183,18 @@ function buildRules(float $budget, array $assessment = []): array
             'Review loan tenure — age may affect eligibility', 'info',
             'Borrower age of 50+ may limit available loan tenure. Confirm with bank.'],
 
+        // A14–A15: Price-to-income ratio uses net annual income.
+        // A high-salary person with heavy commitments has a lower real
+        // purchase power than their gross income suggests.
         ['A14', 'Affordability',
-            fn($p) => (float)($p['median_price'] ?? $p['price'] ?? 0) > 0
-                && $income > 0
-                && ((float)($p['median_price'] ?? $p['price'] ?? 0) / ($income * 12)) <= 5,
-            'Price-to-income ratio is healthy (≤ 5×)', 'positive',
-            'Property price is within 5 times your annual income — standard affordability threshold.'],
+            fn($p) => $priceToNetAnnual($p) > 0 && $priceToNetAnnual($p) <= 5,
+            'Price-to-net-income ratio is healthy (≤ 5×)', 'positive',
+            'Property price is within 5 times your net annual income — within the standard affordability threshold.'],
 
         ['A15', 'Affordability',
-            fn($p) => (float)($p['median_price'] ?? $p['price'] ?? 0) > 0
-                && $income > 0
-                && ((float)($p['median_price'] ?? $p['price'] ?? 0) / ($income * 12)) > 8,
-            'Price-to-income ratio is high (> 8×)', 'warning',
-            'Property costs more than 8 times your annual income — consider carefully.'],
+            fn($p) => $priceToNetAnnual($p) > 8,
+            'Price-to-net-income ratio is high (> 8×)', 'warning',
+            'Property costs more than 8 times your net annual income — consider whether your commitments leave enough room.'],
 
         ['A16', 'Affordability',
             fn($p) => (float)($p['estimated_rental_yield_pct'] ?? 0) > 0
@@ -173,6 +203,42 @@ function buildRules(float $budget, array $assessment = []): array
                     >= (float)($p['est_monthly_mortgage_rm'] ?? 0) * 0.80,
             'Rental income could cover 80%+ of mortgage', 'positive',
             'Estimated rental yield can offset a large portion of the monthly mortgage — strong buy-to-let case.'],
+
+        // A17: Low-commitment advantage — person with minimal commitments
+        // has stronger real affordability than their salary alone implies.
+        ['A17', 'Affordability',
+            fn($p) => $commitmentRatio <= 0.10
+                && $netIncome > 0
+                && (float)($p['est_monthly_mortgage_rm'] ?? 0) > 0
+                && (float)($p['est_monthly_mortgage_rm'] ?? 0) <= $netIncome * 0.45,
+            'Low-commitment buyer — strong real affordability', 'positive',
+            'With minimal existing commitments (≤ 10% of income), your net income comfortably supports this mortgage even at a moderate DSR.'],
+
+        // A18: Heavy-commitment warning — a high earner with large obligations
+        // may be riskier than a moderate earner with none.
+        //
+        // FIX (audit item #3): A18 previously used an INDEPENDENT metric
+        // (gross commitmentRatio > 0.40 AND mortgage > netIncome * 0.35) that
+        // overlapped with A09-A11's net-income-ratio bands without ever being
+        // defined as mutually exclusive with them. A buyer with, e.g.,
+        // commitmentRatio = 0.45 and a mortgage at 36% of net income would
+        // fire BOTH A10 ("Mortgage is 30-40% of net income", severity=info)
+        // and A18 ("bank DSR may be tight", severity=warning) for the exact
+        // same property — two badges describing the same underlying fact
+        // (mortgage stress) using two different number bases, with no
+        // precedence between them.
+        //
+        // A18 is now defined purely as the highest band of the SAME
+        // mortgageToNetRatio metric A09-A11 use, so it is mutually exclusive
+        // with A09/A10/A11 by construction (only one net-ratio band can be
+        // true at a time), and is tagged conflicts_with A09/A10/A11 as a
+        // second line of defense — see evaluateRules() below, which drops
+        // any rule listed in another fired rule's conflicts_with set.
+        ['A18', 'Affordability',
+            fn($p) => $mortgageToNetRatio($p) > 0.40 && $commitmentRatio > 0.40,
+            'High existing commitments — bank DSR may be tight', 'warning',
+            'Your existing monthly commitments are above 40% of gross income and the mortgage exceeds 40% of net income. Banks calculate DSR on remaining capacity — this mortgage may face stricter bank scrutiny regardless of your salary level.',
+            ['A09', 'A10']],
 
 
         // ════════════════════════════════════════════════════════════
@@ -412,25 +478,30 @@ function buildRules(float $budget, array $assessment = []): array
             'Property scores below 55 on sustainability — may have higher running costs.'],
 
         ['H12', 'Smart Home',
-            fn($p) => str_contains($comfortPri, 'energy')
+            fn($p) => $comfortCategory === 'ENERGY'
                 && (int)($p['sustainability_score'] ?? 0) >= 80,
             'Matches your energy efficiency priority', 'positive',
             'You prioritised energy efficiency and this property has a sustainability score of 80+.'],
 
         ['H13', 'Smart Home',
-            fn($p) => str_contains($comfortPri, 'acoustic')
+            fn($p) => $comfortCategory === 'ACOUSTIC'
                 && (int)($p['acoustic_score'] ?? 0) >= 80,
             'Matches your acoustic comfort priority', 'positive',
             'You prioritised acoustic comfort and this property scores 80+ on acoustics.'],
 
-        ['H14', 'Smart Home',
-            fn($p) => str_contains($comfortPri, 'security')
-                && (int)($p['security_score'] ?? 0) >= 80,
-            'Matches your security comfort priority', 'positive',
-            'You prioritised security comfort and this property scores 80+ on security.'],
+        // FIX (audit item #5): H14 ("Matches your security comfort priority",
+        // triggered by str_contains($comfortPri, 'security')) has been
+        // removed. No UI path can produce a comfort_priority value containing
+        // "security" — the closed set is "Family growth" / "Acoustic
+        // comfort" / "Energy efficiency" only — so this rule was dead code
+        // that could never fire. If a security-focused comfort priority is
+        // wanted, add "Security comfort" as a real option in
+        // assets/js/app.js's slidersToAssessmentFields() and to the
+        // $comfortPriorityMap above, then reintroduce this rule keyed off
+        // $comfortCategory === 'SECURITY'.
 
         ['H15', 'Smart Home',
-            fn($p) => str_contains($comfortPri, 'family')
+            fn($p) => $comfortCategory === 'FAMILY'
                 && (int)($p['family_score'] ?? 0) >= 80,
             'Matches your family growth priority', 'positive',
             'You prioritised family growth and this property scores 80+ on family suitability.'],
@@ -642,17 +713,18 @@ function buildRules(float $budget, array $assessment = []): array
 
         // ════════════════════════════════════════════════════════════
         // DOMAIN 8: OCCUPATION SUITABILITY  (O01–O12)
-        // Source: users.occupation (merged into $assessment at call site)
-        // Cross-referenced with: affordability, safety, smart home, space
+        // All income comparisons use NET income (gaji bersih) so that
+        // a high-salary person with heavy obligations is not incorrectly
+        // flagged as "low risk" purely because their gross pay is large.
         // ════════════════════════════════════════════════════════════
 
         ['O01', 'Occupation',
             fn($p) => $isGovt
                 && (float)($p['est_monthly_mortgage_rm'] ?? 0) > 0
-                && $income > 0
-                && ((float)($p['est_monthly_mortgage_rm'] ?? 0) / $income) <= 0.35,
+                && $netIncome > 0
+                && ((float)($p['est_monthly_mortgage_rm'] ?? 0) / $netIncome) <= 0.35,
             'Stable government income — mortgage is manageable', 'positive',
-            'Government/public sector employees have stable income. Mortgage is within 35% of your income — low risk.'],
+            'Government/public sector employees have stable income. After your existing commitments, the mortgage is within 35% of net income — low risk.'],
 
         ['O02', 'Occupation',
             fn($p) => $isSelfEmployed
@@ -670,10 +742,11 @@ function buildRules(float $budget, array $assessment = []): array
 
         ['O04', 'Occupation',
             fn($p) => $isHighIncome
+                && $commitmentRatio <= 0.30
                 && (float)($p['smart_readiness_score'] ?? 0) >= 80
                 && (float)($p['sustainability_score'] ?? 0) >= 75,
             'Premium smart home — suits your professional profile', 'positive',
-            'High-income professionals typically value smart, sustainable homes. This property scores well on both.'],
+            'High-income professionals with manageable commitments typically value smart, sustainable homes. This property scores well on both.'],
 
         ['O05', 'Occupation',
             fn($p) => $isHighIncome
@@ -681,6 +754,27 @@ function buildRules(float $budget, array $assessment = []): array
                 && (float)($p['historical_capital_appreciation_3yr_pct'] ?? 0) >= 4.0,
             'Strong investment asset for high-income buyer', 'positive',
             'High-income earners often use property as an investment vehicle. This property has both good yield and capital growth.'],
+
+        // O05b: Flag when a high earner has heavy commitments — their net capacity
+        // may be no better than a moderate-income buyer with none.
+        //
+        // FIX (audit item #4): O05 (positive: good investment yield) and O05b
+        // (warning: heavy commitments) can legitimately both be true for the
+        // same property — they describe two different facts (investment
+        // quality vs. repayment stress), not a contradiction. Previously they
+        // were surfaced as two independent, unranked badges with no signal to
+        // the consumer that they relate to the same buyer profile. O05b is now
+        // tagged related_to O05 (not conflicts_with, since both can be valid
+        // simultaneously) so formatRuleResult() can group them into a single
+        // "mixed signal" pairing instead of presenting them as unrelated.
+        ['O05b', 'Occupation',
+            fn($p) => $isHighIncome
+                && $commitmentRatio > 0.40
+                && (float)($p['est_monthly_mortgage_rm'] ?? 0) > 0
+                && (float)($p['est_monthly_mortgage_rm'] ?? 0) > $netIncome * 0.40,
+            'High income but heavy commitments — net capacity may be limited', 'warning',
+            'Despite a high salary, your existing obligations consume over 40% of gross income. Your actual repayment capacity (net income) may be similar to a lower-income buyer with no commitments.',
+            [], ['O05']],
 
         ['O06', 'Occupation',
             fn($p) => $isStudent
@@ -711,10 +805,10 @@ function buildRules(float $budget, array $assessment = []): array
         ['O10', 'Occupation',
             fn($p) => $isRetired
                 && (float)($p['est_monthly_mortgage_rm'] ?? 0) > 0
-                && $income > 0
-                && ((float)($p['est_monthly_mortgage_rm'] ?? 0) / $income) > 0.30,
-            'Mortgage may be high relative to retirement income', 'warning',
-            'Retirees typically have fixed income. Mortgage above 30% of income carries elevated risk.'],
+                && $netIncome > 0
+                && ((float)($p['est_monthly_mortgage_rm'] ?? 0) / $netIncome) > 0.30,
+            'Mortgage may be high relative to retirement net income', 'warning',
+            'Retirees typically have fixed income. After existing commitments, this mortgage exceeds 30% of net income — elevated risk.'],
 
         ['O11', 'Occupation',
             fn($p) => $isGovt
@@ -731,26 +825,105 @@ function buildRules(float $budget, array $assessment = []): array
     ];
 }
 
+// FIX (audit item #4): rules previously had no conflict-resolution layer.
+// evaluateRules() collected every condition that returned true into one flat
+// list, so two rules describing the same underlying fact with opposite
+// severities (e.g. the old A10/A18 overlap) could both reach the user as
+// independent, unranked badges with no signal that they contradict each
+// other.
+//
+// Each rule tuple may now optionally carry two extra elements:
+//   [6] conflicts_with  — array of rule IDs that describe the SAME fact with
+//                          a DIFFERENT conclusion. If both fire, the rule
+//                          listed later in the rules array wins (rules are
+//                          authored in increasing specificity order within
+//                          each domain, so "later" means "more specific").
+//                          The loser is dropped entirely, not just hidden.
+//   [7] related_with     — array of rule IDs that describe a DIFFERENT but
+//                          relevant fact about the same profile (both can be
+//                          legitimately true at once, e.g. O05/O05b). These
+//                          are not suppressed — they are grouped together in
+//                          the output so the consumer can render them as a
+//                          single "mixed signal" pairing instead of two
+//                          unrelated badges.
+//
+// Rules that omit these elements default to no conflicts and no relations,
+// so all 108 pre-existing rule definitions work unchanged.
 function evaluateRules(array $property, array $rules): array
 {
     $fired = [];
-    foreach ($rules as [$id, $domain, $condition, $label, $severity, $explanation]) {
+    foreach ($rules as $rule) {
+        [$id, $domain, $condition, $label, $severity, $explanation] = $rule;
+        $conflictsWith = $rule[6] ?? [];
+        $relatedWith   = $rule[7] ?? [];
+
         if ($condition($property)) {
-            $fired[] = [
-                'rule'        => $id,
-                'domain'      => $domain,
-                'label'       => $label,
-                'severity'    => $severity,
-                'explanation' => $explanation,
+            $fired[$id] = [
+                'rule'           => $id,
+                'domain'         => $domain,
+                'label'          => $label,
+                'severity'       => $severity,
+                'explanation'    => $explanation,
+                'conflicts_with' => $conflictsWith,
+                'related_with'   => $relatedWith,
             ];
         }
     }
-    return $fired;
+
+    // ── Conflict resolution pass ───────────────────────────────────────────
+    // IF a fired rule's conflicts_with list names another fired rule THEN
+    // drop the rule that names the conflict (it is the more specific /
+    // later-authored refinement and is treated as authoritative for that
+    // fact) and drop the rule it targets.
+    $firedIds = array_keys($fired);
+    foreach ($fired as $id => $rule) {
+        if (!isset($fired[$id])) {
+            continue; // already removed by an earlier iteration
+        }
+        foreach ($rule['conflicts_with'] as $conflictId) {
+            if (isset($fired[$conflictId])) {
+                unset($fired[$conflictId]);
+            }
+        }
+    }
+
+    // ── Relation pass ───────────────────────────────────────────────────────
+    // IF a fired rule's related_with list names another fired rule THEN tag
+    // both with a shared group_id so the consumer can render them together
+    // instead of as unrelated badges.
+    foreach ($fired as $id => $rule) {
+        foreach ($rule['related_with'] as $relatedId) {
+            if (isset($fired[$relatedId])) {
+                $groupId = implode('+', array_unique(array_merge(
+                    [$id],
+                    array_intersect($rule['related_with'], $firedIds)
+                )));
+                $fired[$id]['related_group'] = $groupId;
+                if (isset($fired[$relatedId])) {
+                    $fired[$relatedId]['related_group'] = $groupId;
+                }
+            }
+        }
+    }
+
+    return array_values($fired);
 }
 
 function formatRuleResult(array $property, array $rules): array
 {
     $fired = evaluateRules($property, $rules);
+
+    // Strip internal-only conflict-resolution metadata (conflicts_with,
+    // related_with — these are rule-ID arrays used to compute related_group
+    // above) before returning to the API consumer. related_group itself is
+    // kept since it's the useful output: a shared identifier the frontend can
+    // use to visually group rules that describe related-but-distinct facts
+    // (e.g. O05 + O05b) instead of presenting them as unconnected badges.
+    $publicize = static function (array $rule): array {
+        unset($rule['conflicts_with'], $rule['related_with']);
+        return $rule;
+    };
+    $fired = array_map($publicize, $fired);
 
     return [
         'property_id'   => (int) $property['id'],

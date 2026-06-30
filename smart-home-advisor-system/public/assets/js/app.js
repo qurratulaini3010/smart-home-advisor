@@ -148,49 +148,44 @@ document.addEventListener("DOMContentLoaded", () => {
     `;
   }
 
-  async function loadAssessmentPreview() {
-    const formData = collectAssessmentData();
-    const params = new URLSearchParams();
-    params.set("action", "recommend");
-    params.set("areas", String(formData.get("preferred_location") || ""));
-    params.set("max_budget", String(formData.get("budget") || ""));
-    params.set("bedrooms", String(formData.get("bedrooms") || ""));
-    params.set("smart_priority", String(formData.get("smart_priority_slider") || 50));
-    params.set("security_priority", String(formData.get("security_priority_slider") || 50));
-    params.set("sustainability_priority", String(formData.get("sustainability_priority_slider") || 50));
-    params.set("family_priority", String(formData.get("family_priority_slider") || 70));
-    params.set("quiet_priority", String(formData.get("quiet_priority_slider") || 50));
+ async function loadAssessmentPreview() {
+  const formData = slidersToAssessmentFields(collectAssessmentData());
 
-    if (formData.get("property_type") && formData.get("property_type") !== "Any") {
-      params.set("property_type", String(formData.get("property_type")));
-    }
-    if (formData.get("tenure_preference") && formData.get("tenure_preference") !== "Any") {
-      params.set("tenure_preference", String(formData.get("tenure_preference")));
-    }
-    if (formData.get("near_school")) {
-      params.set("near_school", "1");
-    }
-    if (formData.get("low_flood_risk")) {
-      params.set("low_flood_risk", "1");
-    }
+  previewResults.innerHTML =
+    '<div class="col-12 text-muted">Finding your preview matches...</div>';
 
-    previewResults.innerHTML = '<div class="col-12 text-muted">Finding your preview matches...</div>';
-    try {
-      const response = await fetch(`api/property-directory.php?${params.toString()}`, {
-        headers: { Accept: "application/json" },
+  try {
+    const response = await fetch(
+      "index.php?action=assessment_preview",
+      {
+        method: "POST",
+        body: formData,
         credentials: "same-origin"
-      });
-      const payload = await response.json();
-      if (!response.ok || !payload.success) {
-        throw new Error(payload.message || "Unable to load preview matches.");
       }
-      previewResults.innerHTML = payload.data.length
-        ? payload.data.slice(0, 6).map(previewCard).join("")
-        : '<div class="col-12 text-muted">No preview matches yet. Try widening the area, budget, or filters.</div>';
-    } catch (error) {
-      previewResults.innerHTML = `<div class="col-12 text-danger">${escapeHtml(error.message)}</div>`;
+    );
+
+    const payload = await response.json();
+
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error || payload.message || "Unable to load preview matches.");
     }
+
+    previewResults.innerHTML = payload.data.length
+      ? payload.data.map((property) => `
+          <div class="col-md-6 col-xl-4">
+            <article class="property-card directory-card h-100">
+              <div class="match-chip">${property.match_percentage}</div>
+              <h3 class="h5 fw-bold text-ink">${property.title}</h3>
+            </article>
+          </div>
+        `).join("")
+      : '<div class="col-12 text-muted">No matching properties found.</div>';
+
+  } catch (error) {
+    previewResults.innerHTML =
+      `<div class="col-12 text-danger">${error.message}</div>`;
   }
+}
 
   function copyAssessmentToFinalForm() {
     const formData = slidersToAssessmentFields(collectAssessmentData());

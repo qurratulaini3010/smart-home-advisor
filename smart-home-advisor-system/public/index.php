@@ -75,9 +75,26 @@ function admin_stats(): array
 
 function save_recommendations(int $assessmentId, array $assessment): void
 {
-    $properties = run_query('SELECT * FROM properties')->fetchAll();
-    $criteria = run_query('SELECT criteria_key, weight FROM assessment_criteria')->fetchAll();
-    $weights = RecommendationEngine::WEIGHTS;
+    // Use net income (gaji bersih) for budget-feasibility filter and scoring
+    $netIncome = (float) ($assessment['net_income'] ?? max(0, (float) $assessment['monthly_income'] - (float) ($assessment['monthly_commitment'] ?? 0)));
+
+    // FIX: Extend filter to 120 % of budget so near-budget properties are
+    // included. The affordability formula already penalises over-budget
+    // properties proportionally, so ranking remains correct.
+    $sql    = 'SELECT * FROM properties WHERE COALESCE(median_price, price) <= ?';
+    $params = [$assessment['budget'] * 1.20];
+
+    // Add location filter if the user specified one
+    if (!empty($assessment['preferred_location'])) {
+        $sql .= ' AND (township LIKE ? OR area LIKE ? OR state LIKE ?)';
+        $searchTerm = '%' . $assessment['preferred_location'] . '%';
+        array_push($params, $searchTerm, $searchTerm, $searchTerm);
+    }
+
+    $properties = run_query($sql, $params)->fetchAll();
+
+    $criteria    = run_query('SELECT criteria_key, weight FROM assessment_criteria')->fetchAll();
+    $weights     = RecommendationEngine::WEIGHTS;
     foreach ($criteria as $criterion) {
         $weights[$criterion['criteria_key']] = ((float) $criterion['weight']) / 100;
     }
@@ -87,21 +104,36 @@ function save_recommendations(int $assessmentId, array $assessment): void
             $weights[$key] = $weight / $weightTotal;
         }
     }
+
     $ranked = [];
 
+    // Pass net_income into assessment so the scoring engine uses gaji bersih.
+    // occupation is already in $assessment when called from assessment_store or
+    // the admin_criteria recalc loop (both now merge it before calling here).
+    $assessmentWithNet = array_merge($assessment, ['net_income' => $netIncome]);
+
     foreach ($properties as $property) {
-        $score = RecommendationEngine::score($assessment, $property, $weights);
-        $ranked[] = ['property' => $property, 'score' => $score];
+        $score = RecommendationEngine::score($assessmentWithNet, $property, $weights);
+
+        // Only keep reasonably good matches
+        if ($score['match_percentage'] > 40) {
+            $ranked[] = ['property' => $property, 'score' => $score];
+        }
     }
 
-    usort($ranked, fn ($a, $b) => $b['score']['total_score'] <=> $a['score']['total_score']);
+    // FIX: Sort by match_percentage — total_score was a redundant duplicate and
+    // has been removed from the engine return value.
+    usort($ranked, fn ($a, $b) => $b['score']['match_percentage'] <=> $a['score']['match_percentage']);
     run_query('DELETE FROM recommendations WHERE assessment_id = ?', [$assessmentId]);
 
-    $rank = 1;
-    foreach ($ranked as $item) {
+    $topRanked = array_slice($ranked, 0, 10);
+    $rank      = 1;
+
+    foreach ($topRanked as $item) {
         run_query(
             'INSERT INTO recommendations
-            (assessment_id, property_id, affordability_score, security_score, smart_score, environment_score, family_score, total_score, match_percentage, rank_position)
+            (assessment_id, property_id, affordability_score, security_score, smart_score,
+             environment_score, family_score, total_score, match_percentage, rank_position)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [
                 $assessmentId,
@@ -111,7 +143,7 @@ function save_recommendations(int $assessmentId, array $assessment): void
                 $item['score']['smart_score'],
                 $item['score']['environment_score'],
                 $item['score']['family_score'],
-                $item['score']['total_score'],
+                $item['score']['match_percentage'],   // FIX: was total_score (now removed)
                 $item['score']['match_percentage'],
                 $rank++,
             ]
@@ -119,9 +151,118 @@ function save_recommendations(int $assessmentId, array $assessment): void
     }
 }
 
+
+ // ====================================================================
+        // 1. LIVE PREVIEW AJAX ENDPOINT (Asynchronous & isolated)
+        // ====================================================================
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'assessment_preview') {
+            header('Content-Type: application/json');
+            try {
+                // Collect submitted wizard choices
+                $budget     = (float) ($_POST['budget'] ?? 0);
+                $income     = (float) ($_POST['monthly_income'] ?? 0);
+                $commitment = (float) ($_POST['monthly_commitment'] ?? 0);
+                $location   = $_POST['preferred_location'] ?? 'Any';
+                $propType   = $_POST['property_type'] ?? 'Any';
+                $household  = (int) ($_POST['household_size'] ?? 1);
+                $comfort    = $_POST['comfort_priority'] ?? '';
+
+                $features = [
+                    'smart_security'   => (int) ($_POST['smart_security']   ?? 0),
+                    'smart_lighting'   => (int) ($_POST['smart_lighting']   ?? 0),
+                    'smart_energy'     => (int) ($_POST['smart_energy']     ?? 0),
+                    'smart_appliances' => (int) ($_POST['smart_appliances'] ?? 0),
+                ];
+
+                // Fetch user weights from assessment_criteria
+                $criteria = run_query('SELECT criteria_key, weight FROM assessment_criteria')->fetchAll();
+                $weights  = RecommendationEngine::WEIGHTS;
+                foreach ($criteria as $criterion) {
+                    $weights[$criterion['criteria_key']] = ((float) $criterion['weight']) / 100;
+                }
+                $weightTotal = array_sum($weights);
+                if ($weightTotal > 0) {
+                    foreach ($weights as $key => $weight) {
+                        $weights[$key] = $weight / $weightTotal;
+                    }
+                }
+
+                // FIX: Extend filter to 120 % of budget — same as save_recommendations —
+                // so the preview and saved results are drawn from the same candidate pool.
+                $sql    = 'SELECT * FROM properties WHERE COALESCE(median_price, price) <= ?';
+                $params = [$budget * 1.20];
+
+                if (!empty($location) && $location !== 'Any') {
+                    $sql .= ' AND (township LIKE ? OR area LIKE ? OR state LIKE ?)';
+                    $searchTerm = '%' . $location . '%';
+                    array_push($params, $searchTerm, $searchTerm, $searchTerm);
+                }
+                $properties = run_query($sql, $params)->fetchAll();
+
+                // FIX: Fetch the logged-in user's occupation so occupation-based
+                // adjustments in the engine are actually applied during preview.
+                $previewOccupation = '';
+                if (Auth::check()) {
+                    $uRow = run_query(
+                        'SELECT occupation FROM users WHERE id = ? LIMIT 1',
+                        [(int) Auth::user()['id']]
+                    )->fetch();
+                    $previewOccupation = $uRow['occupation'] ?? '';
+                }
+
+                $netIncome      = max(0.0, $income - $commitment);
+                $assessmentMock = [
+                    'budget'             => $budget,
+                    'monthly_income'     => $income,
+                    'monthly_commitment' => $commitment,
+                    'net_income'         => $netIncome,
+                    'preferred_location' => $location,
+                    'property_type'      => $propType,
+                    'household_size'     => $household,
+                    'comfort_priority'   => $comfort,
+                    'occupation'         => $previewOccupation,   // FIX: was always missing
+                    'smart_security'     => $features['smart_security'],
+                    'smart_lighting'     => $features['smart_lighting'],
+                    'smart_energy'       => $features['smart_energy'],
+                    'smart_appliances'   => $features['smart_appliances'],
+                ];
+
+                $scored = [];
+                foreach ($properties as $property) {
+                    $scoreDetails = RecommendationEngine::score($assessmentMock, $property, $weights);
+                    if ($scoreDetails['match_percentage'] > 40) {
+                        $scored[] = [
+                            'id'               => $property['id'],
+                            'title'            => $property['property_name'] ?? $property['township'] ?? 'Property',
+                            'match_percentage' => number_format((float) $scoreDetails['match_percentage'], 1) . '%',
+                            '_sort'            => $scoreDetails['match_percentage'],
+                        ];
+                    }
+                }
+
+                // FIX: Sort by match_percentage (total_score was redundant — now removed).
+                usort($scored, fn ($a, $b) => $b['_sort'] <=> $a['_sort']);
+                // Strip the internal sort key before sending to client
+                $output = array_map(static fn ($r) => [
+                    'id'               => $r['id'],
+                    'title'            => $r['title'],
+                    'match_percentage' => $r['match_percentage'],
+                ], array_slice($scored, 0, 3));
+
+                echo json_encode(['success' => true, 'data' => $output]);
+            } catch (Throwable $e) {
+                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            }
+            exit;
+        }
+        
+// ====================================================================
+// 2. STANDARD PERSISTENT FORMS (Original security context untouched)
+// ====================================================================
 if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
     Csrf::verify();
     $action = $_POST['action'] ?? '';
+
 
     if ($action === 'register') {
         $name = trim((string) post('full_name'));
@@ -175,33 +316,71 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'assessment_store') {
         Auth::requireLogin();
+        $grossIncome    = (float) post('monthly_income');
+        $commitment     = max(0.0, (float) post('monthly_commitment'));
+        // Net income (gaji bersih) = gross income minus all monthly commitments
+        $netIncome      = max(0.0, $grossIncome - $commitment);
+
         $assessment = [
-            'user_id' => Auth::user()['id'],
-            'age' => (int) post('age'),
-            'monthly_income' => (float) post('monthly_income'),
-            'budget' => (float) post('budget'),
-            'household_size' => (int) post('household_size'),
+            'user_id'            => Auth::user()['id'],
+            'age'                => (int) post('age'),
+            'monthly_income'     => $grossIncome,
+            'monthly_commitment' => $commitment,
+            // net_income is a generated column in DB, but we pass it in $assessment array
+            // so rules engine can use it directly without re-computing
+            'net_income'         => $netIncome,
+            'budget'             => (float) post('budget'),
+            'household_size'     => (int) post('household_size'),
             'preferred_location' => trim((string) post('preferred_location')),
-            'property_type' => (string) post('property_type', 'Any'),
-            'smart_lighting' => in_array((string) post('smart_lighting', '0'), ['1', 'on'], true) ? 1 : 0,
-            'smart_security' => in_array((string) post('smart_security', '0'), ['1', 'on'], true) ? 1 : 0,
-            'smart_appliances' => in_array((string) post('smart_appliances', '0'), ['1', 'on'], true) ? 1 : 0,
-            'smart_energy' => in_array((string) post('smart_energy', '0'), ['1', 'on'], true) ? 1 : 0,
-            'comfort_priority' => (string) post('comfort_priority'),
+            'property_type'      => (string) post('property_type', 'Any'),
+            'smart_lighting'     => in_array((string) post('smart_lighting', '0'), ['1', 'on'], true) ? 1 : 0,
+            'smart_security'     => in_array((string) post('smart_security', '0'), ['1', 'on'], true) ? 1 : 0,
+            'smart_appliances'   => in_array((string) post('smart_appliances', '0'), ['1', 'on'], true) ? 1 : 0,
+            'smart_energy'       => in_array((string) post('smart_energy', '0'), ['1', 'on'], true) ? 1 : 0,
+            'comfort_priority'   => (string) post('comfort_priority'),
         ];
 
-        if ($assessment['monthly_income'] <= 0 || $assessment['budget'] <= 0 || $assessment['household_size'] <= 0) {
+        if ($grossIncome <= 0 || $assessment['budget'] <= 0 || $assessment['household_size'] <= 0) {
             flash('Please complete the assessment numbers before continuing.', 'danger');
+            redirect('assessment');
+        }
+        if ($netIncome <= 0) {
+            flash('Your monthly commitments exceed your income. Please review your financial details.', 'danger');
             redirect('assessment');
         }
 
         run_query(
             'INSERT INTO assessments
-            (user_id, age, monthly_income, budget, household_size, preferred_location, property_type, smart_lighting, smart_security, smart_appliances, smart_energy, comfort_priority)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            array_values($assessment)
+            (user_id, age, monthly_income, monthly_commitment, budget, household_size, preferred_location, property_type, smart_lighting, smart_security, smart_appliances, smart_energy, comfort_priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                $assessment['user_id'],
+                $assessment['age'],
+                $assessment['monthly_income'],
+                $assessment['monthly_commitment'],
+                $assessment['budget'],
+                $assessment['household_size'],
+                $assessment['preferred_location'],
+                $assessment['property_type'],
+                $assessment['smart_lighting'],
+                $assessment['smart_security'],
+                $assessment['smart_appliances'],
+                $assessment['smart_energy'],
+                $assessment['comfort_priority'],
+            ]
         );
         $assessmentId = (int) Database::connect()->lastInsertId();
+
+        // FIX: Merge the user's occupation into the assessment array so that
+        // occupation-based scoring adjustments in RecommendationEngine are
+        // actually applied. Occupation is stored in the users table, not in
+        // assessments, so it must be fetched and injected here.
+        $uRow = run_query(
+            'SELECT occupation FROM users WHERE id = ? LIMIT 1',
+            [(int) Auth::user()['id']]
+        )->fetch();
+        $assessment['occupation'] = $uRow['occupation'] ?? '';
+
         save_recommendations($assessmentId, $assessment);
         redirect('results', ['id' => $assessmentId]);
     }
@@ -311,14 +490,19 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
         );
     }
 
-    // Recalculate all recommendations
+    // FIX: Join with users table so each assessment carries its owner's
+    // occupation. Previously the recalc loop used assessments alone, meaning
+    // occupation was always '' and all occupation-based score adjustments
+    // were silently skipped for every recalculation.
     $assessments = run_query(
-        'SELECT * FROM assessments'
+        'SELECT a.*, u.occupation
+         FROM assessments a
+         JOIN users u ON u.id = a.user_id'
     )->fetchAll();
 
     foreach ($assessments as $assessment) {
         save_recommendations(
-            (int)$assessment['id'],
+            (int) $assessment['id'],
             $assessment
         );
     }
@@ -629,6 +813,7 @@ if ($page === 'landing'): ?>
                 <input type="hidden" name="action" value="assessment_store">
                 <input type="hidden" name="age" value="">
                 <input type="hidden" name="monthly_income" value="">
+                <input type="hidden" name="monthly_commitment" value="">
                 <input type="hidden" name="budget" value="">
                 <input type="hidden" name="household_size" value="">
                 <input type="hidden" name="preferred_location" value="">
@@ -650,8 +835,23 @@ if ($page === 'landing'): ?>
                             <input class="form-control" type="number" name="age" min="18" value="25" data-assessment-field>
                         </div>
                         <div class="col-md-3">
-                            <label class="form-label">Monthly Income (RM)</label>
-                            <input class="form-control" type="number" name="monthly_income" min="1" required placeholder="6500" data-assessment-field>
+                            <label class="form-label">Gross Monthly Income (RM)
+                                <span class="text-muted small">before deductions</span>
+                            </label>
+                            <input class="form-control" type="number" name="monthly_income" min="1" required placeholder="6500" data-assessment-field id="fieldGrossIncome">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Monthly Commitments (RM)
+                                <span class="text-muted small">car loan, study loan, credit card, etc.</span>
+                            </label>
+                            <input class="form-control" type="number" name="monthly_commitment" min="0" value="0" placeholder="1200" data-assessment-field id="fieldCommitment">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Gaji Bersih / Net Income (RM)
+                                <span class="text-muted small">auto-calculated</span>
+                            </label>
+                            <input class="form-control bg-light fw-bold text-sage" type="number" id="fieldNetIncome" name="net_income_display" readonly placeholder="0" tabindex="-1">
+                            <div id="netIncomeWarning" class="text-danger small mt-1" style="display:none;">⚠️ Commitments exceed income — please review.</div>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">Budget (RM)</label>
@@ -662,6 +862,96 @@ if ($page === 'landing'): ?>
                             <input class="form-control" type="number" name="household_size" min="1" required placeholder="3" data-assessment-field>
                         </div>
                     </div>
+                    <script>
+                        (function () {
+                            const finalForm = document.getElementById('assessmentFinalForm');
+                            const grossInput = document.getElementById('fieldGrossIncome');
+                            const commitInput = document.getElementById('fieldCommitment');
+
+                            function recalcNet() {
+                                var gross = parseFloat(grossInput.value) || 0;
+                                var commit = parseFloat(commitInput.value) || 0;
+                                var net = Math.max(0, gross - commit);
+                                
+                                var netField = document.getElementById('fieldNetIncome');
+                                if (netField) netField.value = net > 0 ? net.toFixed(0) : '';
+                                
+                                var warn = document.getElementById('netIncomeWarning');
+                                if (warn) warn.style.display = (gross > 0 && commit >= gross) ? '' : 'none';
+                                
+                                // Instant synchronization with hidden fields
+                                if (finalForm) {
+                                    const hGross = finalForm.querySelector('input[name="monthly_income"]');
+                                    const hCommit = finalForm.querySelector('input[name="monthly_commitment"]');
+                                    if (hGross) hGross.value = grossInput.value;
+                                    if (hCommit) hCommit.value = commitInput.value;
+                                }
+                            }
+
+                            if (grossInput) grossInput.addEventListener('input', recalcNet);
+                            if (commitInput) commitInput.addEventListener('input', recalcNet);
+
+                            // Dynamic Live PHP Scoring Update Logic
+                            function fetchLivePHPPreview() {
+                                if (!finalForm) return;
+                                
+                                const formData = new FormData();
+                                // Send CSRF token so the outer POST handler doesn't reject the request
+                                const csrfInput = document.querySelector('input[name="csrf_token"]');
+                                if (csrfInput) formData.append('csrf_token', csrfInput.value);
+
+                                formData.append('monthly_income', grossInput ? grossInput.value : '0');
+                                formData.append('monthly_commitment', commitInput ? commitInput.value : '0');
+                                
+                                // Safely extract input selections based on your DOM tree names/IDs
+                                formData.append('budget', document.getElementsByName('budget')[0]?.value || '0');
+                                formData.append('preferred_location', document.getElementsByName('preferred_location')[0]?.value || 'Any');
+                                formData.append('property_type', document.getElementsByName('property_type')[0]?.value || 'Any');
+                                formData.append('household_size', document.getElementsByName('household_size')[0]?.value || '1');
+                                formData.append('comfort_priority', document.getElementsByName('comfort_priority')[0]?.value || '');
+                                
+                                // Append smart home parameters
+                                ['smart_security', 'smart_lighting', 'smart_energy', 'smart_appliances'].forEach(f => {
+                                    const el = document.querySelector(`input[name="${f}"]`);
+                                    formData.append(f, el && el.checked ? '1' : '0');
+                                });
+
+                                fetch('?action=assessment_preview', {
+                                    method: 'POST',
+                                    body: formData
+                                })
+                                .then(res => res.json())
+                                .then(res => {
+                                    if (res.success && res.data) {
+                                        updatePreviewDOM(res.data);
+                                    }
+                                })
+                                .catch(err => console.error("Preview endpoint synchronization failed:", err));
+                            }
+
+                            function updatePreviewDOM(properties) {
+                                // Target badges inside your visual cards layout on step 4 preview
+                                const badges = document.querySelectorAll('.card-badge-match, .match-percentage-badge, [data-preview-match]');
+                                
+                                properties.forEach((prop, index) => {
+                                    if (badges[index]) {
+                                        badges[index].innerText = prop.match_percentage;
+                                    }
+                                });
+                            }
+
+                            // Attach step-change event listeners to buttons
+                            const stepsButtons = document.querySelectorAll('[data-wizard-next], .btn-next, .btn-sage');
+                            stepsButtons.forEach(btn => {
+                                btn.addEventListener('click', function() {
+                                    // Wait brief moment for wizard step-animations to focus on step 4 card lists
+                                    setTimeout(fetchLivePHPPreview, 100);
+                                });
+                            });
+
+                            recalcNet();
+                        })();
+                        </script>
                 </div>
 
                 <div class="advisor-step" data-assessment-step="2">
@@ -752,12 +1042,52 @@ if ($page === 'landing'): ?>
         'SELECT r.*, p.* FROM recommendations r JOIN properties p ON p.id = r.property_id WHERE r.assessment_id = ? ORDER BY r.rank_position ASC',
         [$assessmentId]
     )->fetchAll();
+    // Compute net income for display — use DB generated column if available, otherwise derive it
+    $displayNetIncome = (float) ($assessment['net_income']
+        ?? max(0, (float)$assessment['monthly_income'] - (float)($assessment['monthly_commitment'] ?? 0)));
+    $displayCommitment = (float) ($assessment['monthly_commitment'] ?? 0);
+    $commitmentRatioDisplay = (float)$assessment['monthly_income'] > 0
+        ? round($displayCommitment / (float)$assessment['monthly_income'] * 100, 1) : 0;
     ?>
     <section class="container py-5">
         <div class="d-flex justify-content-between gap-3 flex-wrap mb-4">
             <div><p class="eyebrow">Recommendation results</p><h1 class="fw-bold text-sage">Ranked property matches</h1></div>
             <button class="btn btn-outline-sage" onclick="window.print()"><i class="fa-solid fa-file-pdf me-2"></i>Print PDF Report</button>
         </div>
+
+        <!-- Gaji Bersih Summary Panel -->
+        <div class="system-card p-3 mb-4">
+            <p class="eyebrow mb-2">Financial Profile Used for Ranking</p>
+            <div class="row g-3 text-center">
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Gross Monthly Income</div>
+                    <div class="fw-bold text-ink"><?= money((float)$assessment['monthly_income']) ?></div>
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Monthly Commitments</div>
+                    <div class="fw-bold <?= $commitmentRatioDisplay > 40 ? 'text-danger' : 'text-ink' ?>"><?= money($displayCommitment) ?>
+                        <?php if ($commitmentRatioDisplay > 0): ?>
+                        <span class="small text-muted">(<?= $commitmentRatioDisplay ?>% of income)</span>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Gaji Bersih (Net Income)</div>
+                    <div class="fw-bold text-sage fs-5"><?= money($displayNetIncome) ?></div>
+                    <div class="text-muted" style="font-size:0.72rem;">Used for mortgage stress analysis</div>
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Budget</div>
+                    <div class="fw-bold text-ink"><?= money((float)$assessment['budget']) ?></div>
+                </div>
+            </div>
+            <?php if ($commitmentRatioDisplay > 40): ?>
+            <div class="alert alert-warning mt-3 mb-0 py-2 small">
+                ⚠️ Your existing commitments are <strong><?= $commitmentRatioDisplay ?>%</strong> of your gross income. Property rankings reflect your <strong>net repayment capacity</strong>, not gross salary alone.
+            </div>
+            <?php endif; ?>
+        </div>
+
         <div class="row g-4">
             <?php foreach ($rows as $row): ?>
                 <div class="col-lg-4">

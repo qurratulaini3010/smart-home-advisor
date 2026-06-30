@@ -54,18 +54,27 @@ final class PropertyDirectoryRepository
         $params = [':user_id' => $userId];
 
         if (!empty($filters['query'])) {
-            $conditions[] = '(p.township LIKE :query OR p.area LIKE :query OR p.property_name LIKE :query OR p.location LIKE :query)';
-            $params[':query'] = '%' . trim((string) $filters['query']) . '%';
+            $conditions[] = '(p.township LIKE :query_township OR p.area LIKE :query_area OR p.property_name LIKE :query_name OR p.location LIKE :query_location)';
+            $queryVal = '%' . trim((string) $filters['query']) . '%';
+            $params[':query_township'] = $queryVal;
+            $params[':query_area']     = $queryVal;
+            $params[':query_name']     = $queryVal;
+            $params[':query_location'] = $queryVal;
         }
 
         if (!empty($filters['township_area'])) {
-            $conditions[] = '(p.township LIKE :township_area OR p.area LIKE :township_area OR p.location LIKE :township_area)';
-            $params[':township_area'] = '%' . trim((string) $filters['township_area']) . '%';
+            $conditions[] = '(p.township LIKE :ta_township OR p.area LIKE :ta_area OR p.location LIKE :ta_location)';
+            $taVal = '%' . trim((string) $filters['township_area']) . '%';
+            $params[':ta_township'] = $taVal;
+            $params[':ta_area']     = $taVal;
+            $params[':ta_location'] = $taVal;
         }
 
         if (!empty($filters['property_type'])) {
-            $conditions[] = '(p.property_type = :property_type OR p.type = :property_type)';
-            $params[':property_type'] = trim((string) $filters['property_type']);
+            $conditions[] = '(p.property_type = :pt_type1 OR p.type = :pt_type2)';
+            $ptVal = trim((string) $filters['property_type']);
+            $params[':pt_type1'] = $ptVal;
+            $params[':pt_type2'] = $ptVal;
         }
 
         if (!empty($filters['tenure_preference']) && $filters['tenure_preference'] !== 'Any') {
@@ -171,7 +180,12 @@ final class PropertyDirectoryRepository
                 : 0;
             $floodBonus = !empty($preferences['low_flood_risk']) && strtolower((string) $row['flood_risk']) === 'low' ? 8 : 0;
 
-            $row['advisor_match_score'] = round(($weightTotal > 0 ? $score / $weightTotal : 0) + $schoolBonus + $floodBonus, 2);
+            // FIX: Cap at 100 — school/flood bonuses could previously push the
+            // value above 100, making it display as e.g. "107% match".
+            $row['advisor_match_score'] = min(100.0, round(
+                ($weightTotal > 0 ? $score / $weightTotal : 0) + $schoolBonus + $floodBonus,
+                2
+            ));
         }
         unset($row);
 

@@ -55,6 +55,8 @@ CREATE TABLE assessments (
   user_id INT NOT NULL,
   age INT,
   monthly_income DECIMAL(12,2) NOT NULL,
+  monthly_commitment DECIMAL(12,2) NOT NULL DEFAULT 0,
+  net_income DECIMAL(12,2) GENERATED ALWAYS AS (monthly_income - monthly_commitment) STORED,
   budget DECIMAL(12,2) NOT NULL,
   household_size INT NOT NULL,
   preferred_location VARCHAR(255),
