@@ -2,6 +2,9 @@
 
 A PHP web application that helps property buyers find homes that match their financial situation, lifestyle, and smart-home preferences. Buyers fill out a short assessment (budget, income, household size, occupation, smart-home priorities), and the system scores every property in the catalogue against that profile, explaining each score with plain-language rule-based badges.
 
+[Go to Documentation](README2.md)
+
+for details on rule fire and system explaination
 ---
 
 ## 1. System Overview
