@@ -36,6 +36,13 @@ This system has **two separate but related decision-making components**, both ke
 
 Both pull occupation classification from a single shared, mutually-exclusive classifier (`RecommendationEngine::classifyOccupation()`) so a user's job title (e.g. "Retired Civil Servant") is always categorized the same way in both the score and the badges.
 
+### Known orphaned code (not wired into the live app)
+
+Two groups of files exist in the codebase but are not currently reachable from any page, button, or script — they were either superseded or never finished. They're harmless to leave in place, but worth knowing about if you're exploring the codebase:
+
+- **Insights feature**: `database/schema_insights.sql`, `database/import_excel.php`, `public/api/insights.php` — a self-contained analytics table/API with no frontend consumer.
+- **Property components prototype**: `public/components/customer-property-cards.html`, `public/components/staff-property-table.html`, `public/assets/js/property-components.js` — an earlier draft of the property directory UI, superseded by `public/partials/property_directory_tabs.php` + `public/assets/js/property-advisor.js`, which is what the live app actually uses.
+
 ---
 
 ## 2. Setup on a New Laptop

@@ -274,10 +274,18 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('register');
         }
 
+        $dob = trim((string) post('date_of_birth'));
+        if ($dob !== '') {
+            $dobTs = strtotime($dob);
+            if ($dobTs === false || $dobTs >= strtotime('-18 years')) {
+                flash('Please enter a valid date of birth. You must be at least 18 years old.', 'danger');
+                redirect('register');
+            }
+        }
         try {
             run_query(
-                'INSERT INTO users (full_name, email, password, phone, occupation, role) VALUES (?, ?, ?, ?, ?, ?)',
-                [$name, $email, password_hash($password, PASSWORD_DEFAULT), post('phone'), post('occupation'), 'user']
+                'INSERT INTO users (full_name, email, password, phone, occupation, date_of_birth, role) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [$name, $email, password_hash($password, PASSWORD_DEFAULT), post('phone'), post('occupation'), $dob !== '' ? $dob : null, 'user']
             );
             flash('Account created. You can sign in now.');
             redirect('login');
@@ -306,31 +314,137 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'profile') {
         Auth::requireLogin();
+        $dob = trim((string) post('date_of_birth'));
+        if ($dob !== '') {
+            $dobTs = strtotime($dob);
+            if ($dobTs === false || $dobTs >= strtotime('-18 years')) {
+                flash('Please enter a valid date of birth. You must be at least 18 years old.', 'danger');
+                redirect('profile');
+            }
+        }
         run_query(
-            'UPDATE users SET full_name = ?, phone = ?, occupation = ? WHERE id = ?',
-            [post('full_name'), post('phone'), post('occupation'), Auth::user()['id']]
+            'UPDATE users SET full_name = ?, phone = ?, occupation = ?, date_of_birth = ? WHERE id = ?',
+            [
+                trim((string) post('full_name')),
+                trim((string) post('phone')),
+                (string) post('occupation'),
+                $dob !== '' ? $dob : null,
+                Auth::user()['id'],
+            ]
         );
         flash('Profile updated.');
         redirect('profile');
     }
 
+    if ($action === 'financial_profile_save') {
+        Auth::requireLogin();
+        $gross = (float) post('gross_monthly_income');
+        if ($gross <= 0) {
+            flash('Please enter a valid gross monthly income greater than zero.', 'danger');
+            redirect('financial_profile');
+        }
+        run_query(
+            'UPDATE users SET gross_monthly_income = ? WHERE id = ?',
+            [$gross, Auth::user()['id']]
+        );
+        flash('Income saved.');
+        redirect('financial_profile');
+    }
+
+    if ($action === 'commitment_add') {
+        Auth::requireLogin();
+        $label    = trim((string) post('label'));
+        $category = (string) post('category');
+        $amount   = (float) post('amount');
+        $allowed  = ['car_loan','study_loan','personal_loan','credit_card','existing_mortgage','other'];
+        if ($label === '') {
+            flash('Please enter a description for this commitment.', 'danger');
+            redirect('financial_profile');
+        }
+        if (!in_array($category, $allowed, true)) {
+            flash('Invalid commitment category.', 'danger');
+            redirect('financial_profile');
+        }
+        if ($amount <= 0) {
+            flash('Amount must be greater than zero.', 'danger');
+            redirect('financial_profile');
+        }
+        run_query(
+            'INSERT INTO user_commitments (user_id, label, category, amount) VALUES (?, ?, ?, ?)',
+            [Auth::user()['id'], $label, $category, $amount]
+        );
+        flash('Commitment added.');
+        redirect('financial_profile');
+    }
+
+    if ($action === 'commitment_delete') {
+        Auth::requireLogin();
+        $commitId = (int) post('commitment_id');
+        if ($commitId <= 0) {
+            flash('Invalid commitment.', 'danger');
+            redirect('financial_profile');
+        }
+        $row = run_query(
+            'SELECT id FROM user_commitments WHERE id = ? AND user_id = ?',
+            [$commitId, Auth::user()['id']]
+        )->fetch();
+        if (!$row) {
+            flash('Commitment not found.', 'danger');
+            redirect('financial_profile');
+        }
+        run_query('DELETE FROM user_commitments WHERE id = ?', [$commitId]);
+        flash('Commitment removed.', 'warning');
+        redirect('financial_profile');
+    }
+
     if ($action === 'assessment_store') {
         Auth::requireLogin();
-        $grossIncome    = (float) post('monthly_income');
-        $commitment     = max(0.0, (float) post('monthly_commitment'));
-        // Net income (gaji bersih) = gross income minus all monthly commitments
-        $netIncome      = max(0.0, $grossIncome - $commitment);
+        $uid = (int) Auth::user()['id'];
+
+        // Pull income + commitments from financial profile — not from the form.
+        // If the user hasn't set up their financial profile yet, redirect them there first.
+        $uRow = run_query(
+            'SELECT occupation, gross_monthly_income, date_of_birth FROM users WHERE id = ? LIMIT 1',
+            [$uid]
+        )->fetch();
+
+        $grossIncome = (float) ($uRow['gross_monthly_income'] ?? 0);
+        if ($grossIncome <= 0) {
+            flash('Please set up your financial profile (income and commitments) before running an assessment.', 'danger');
+            redirect('financial_profile');
+        }
+
+        $totalCommitment = (float) run_query(
+            'SELECT COALESCE(SUM(amount),0) AS total FROM user_commitments WHERE user_id = ?',
+            [$uid]
+        )->fetch()['total'];
+
+        $netIncome = max(0.0, $grossIncome - $totalCommitment);
+        if ($netIncome <= 0) {
+            flash('Your total monthly commitments exceed your gross income. Please review your financial profile.', 'danger');
+            redirect('financial_profile');
+        }
+
+        // Derive age from date_of_birth stored in the users table
+        $age = null;
+        if (!empty($uRow['date_of_birth'])) {
+            $age = (int) date_diff(new DateTime($uRow['date_of_birth']), new DateTime())->y;
+        }
+
+        $budget = (float) post('budget');
+        if ($budget <= 0) {
+            flash('Please enter a valid budget.', 'danger');
+            redirect('assessment');
+        }
 
         $assessment = [
-            'user_id'            => Auth::user()['id'],
-            'age'                => (int) post('age'),
+            'user_id'            => $uid,
+            'age'                => $age,
             'monthly_income'     => $grossIncome,
-            'monthly_commitment' => $commitment,
-            // net_income is a generated column in DB, but we pass it in $assessment array
-            // so rules engine can use it directly without re-computing
+            'monthly_commitment' => $totalCommitment,
             'net_income'         => $netIncome,
-            'budget'             => (float) post('budget'),
-            'household_size'     => (int) post('household_size'),
+            'budget'             => $budget,
+            'household_size'     => 1, // kept in DB for backward compat; no longer collected
             'preferred_location' => trim((string) post('preferred_location')),
             'property_type'      => (string) post('property_type', 'Any'),
             'smart_lighting'     => in_array((string) post('smart_lighting', '0'), ['1', 'on'], true) ? 1 : 0,
@@ -338,16 +452,8 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
             'smart_appliances'   => in_array((string) post('smart_appliances', '0'), ['1', 'on'], true) ? 1 : 0,
             'smart_energy'       => in_array((string) post('smart_energy', '0'), ['1', 'on'], true) ? 1 : 0,
             'comfort_priority'   => (string) post('comfort_priority'),
+            'occupation'         => $uRow['occupation'] ?? '',
         ];
-
-        if ($grossIncome <= 0 || $assessment['budget'] <= 0 || $assessment['household_size'] <= 0) {
-            flash('Please complete the assessment numbers before continuing.', 'danger');
-            redirect('assessment');
-        }
-        if ($netIncome <= 0) {
-            flash('Your monthly commitments exceed your income. Please review your financial details.', 'danger');
-            redirect('assessment');
-        }
 
         run_query(
             'INSERT INTO assessments
@@ -370,16 +476,6 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
             ]
         );
         $assessmentId = (int) Database::connect()->lastInsertId();
-
-        // FIX: Merge the user's occupation into the assessment array so that
-        // occupation-based scoring adjustments in RecommendationEngine are
-        // actually applied. Occupation is stored in the users table, not in
-        // assessments, so it must be fetched and injected here.
-        $uRow = run_query(
-            'SELECT occupation FROM users WHERE id = ? LIMIT 1',
-            [(int) Auth::user()['id']]
-        )->fetch();
-        $assessment['occupation'] = $uRow['occupation'] ?? '';
 
         save_recommendations($assessmentId, $assessment);
         redirect('results', ['id' => $assessmentId]);
@@ -480,39 +576,6 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect('admin_users');
     }
 
-    if ($action === 'admin_criteria') {
-    Auth::requireAdmin();
-
-    foreach ($_POST['weights'] ?? [] as $key => $weight) {
-        run_query(
-            'UPDATE assessment_criteria SET weight = ? WHERE criteria_key = ?',
-            [(float) $weight, $key]
-        );
-    }
-
-    // FIX: Join with users table so each assessment carries its owner's
-    // occupation. Previously the recalc loop used assessments alone, meaning
-    // occupation was always '' and all occupation-based score adjustments
-    // were silently skipped for every recalculation.
-    $assessments = run_query(
-        'SELECT a.*, u.occupation
-         FROM assessments a
-         JOIN users u ON u.id = a.user_id'
-    )->fetchAll();
-
-    foreach ($assessments as $assessment) {
-        save_recommendations(
-            (int) $assessment['id'],
-            $assessment
-        );
-    }
-
-    flash(
-        'Criteria weights updated and all recommendations recalculated.'
-    );
-
-    redirect('admin_criteria');
-}
 }
 
 if ($page === 'logout') {
@@ -730,9 +793,13 @@ if ($page === 'landing'): ?>
                                 <option>Other</option>
                             </optgroup>
                         </select>
+                        <label class="form-label">Date of Birth <span class="text-muted small">(must be 18 or older)</span></label>
+                        <input class="form-control" type="date" name="date_of_birth"
+                               max="<?= date('Y-m-d', strtotime('-18 years')) ?>"
+                               placeholder="YYYY-MM-DD">
                     <?php endif; ?>
                     <input class="form-control" type="email" name="email" required placeholder="Email address">
-                    <input class="form-control" type="password" name="password" required placeholder="Password">
+                    <input class="form-control" type="password" name="password" required placeholder="Password (min 8 characters)">
                     <button class="btn btn-sage btn-lg" type="submit"><?= $page === 'register' ? 'Create Account' : 'Login' ?></button>
                     <div class="d-flex justify-content-between small">
                         <a href="<?= route($page === 'register' ? 'login' : 'register') ?>"><?= $page === 'register' ? 'Already have an account?' : 'Create account' ?></a>
@@ -781,6 +848,7 @@ if ($page === 'landing'): ?>
                         <a class="btn btn-outline-sage" href="#favorited-properties">Saved Favorites</a>
                         <a class="btn btn-outline-sage" href="<?= route('mortgage') ?>">Mortgage Calculator</a>
                         <a class="btn btn-outline-sage" href="<?= route('profile') ?>">Edit Profile</a>
+                        <a class="btn btn-outline-sage" href="<?= route('financial_profile') ?>">Financial Profile</a>
                     </div>
                 </div>
             </div>
@@ -789,9 +857,23 @@ if ($page === 'landing'): ?>
     </section>
 <?php elseif ($page === 'assessment'):
     Auth::requireLogin();
+    $uid = (int) Auth::user()['id'];
+    // Load the user's saved financial profile to pre-fill income/commitment on this page
+    $financialUser = run_query(
+        'SELECT gross_monthly_income, date_of_birth FROM users WHERE id = ? LIMIT 1',
+        [$uid]
+    )->fetch();
+    $profileGross = (float) ($financialUser['gross_monthly_income'] ?? 0);
+    $profileCommitment = (float) run_query(
+        'SELECT COALESCE(SUM(amount),0) AS total FROM user_commitments WHERE user_id = ?',
+        [$uid]
+    )->fetch()['total'];
+    $profileNet = max(0, $profileGross - $profileCommitment);
+    $profileMissing = $profileGross <= 0;
+
     $lastAssessment = run_query(
         'SELECT budget FROM assessments WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-        [Auth::user()['id']]
+        [$uid]
     )->fetch();
     $lastBudget = (float) ($lastAssessment['budget'] ?? 0);
     ?>
@@ -808,14 +890,31 @@ if ($page === 'landing'): ?>
                 <span data-assessment-step-indicator="4">4</span>
             </div>
 
+            <?php if ($profileMissing): ?>
+                <div class="alert alert-warning d-flex align-items-center gap-3 mb-4">
+                    <i class="fa-solid fa-triangle-exclamation fa-lg"></i>
+                    <div>
+                        <strong>Financial profile not set up yet.</strong>
+                        Your assessment needs your income and commitment details to work.
+                        <a class="alert-link ms-1" href="<?= route('financial_profile') ?>">Set it up now &rarr;</a>
+                    </div>
+                </div>
+            <?php else: ?>
+                <div class="alert alert-sage d-flex align-items-center justify-content-between gap-3 mb-4">
+                    <div>
+                        <i class="fa-solid fa-circle-check me-2 text-sage"></i>
+                        <strong>Income:</strong> RM <?= number_format($profileGross, 0) ?> &nbsp;&middot;&nbsp;
+                        <strong>Commitments:</strong> RM <?= number_format($profileCommitment, 0) ?> &nbsp;&middot;&nbsp;
+                        <strong>Net:</strong> RM <?= number_format($profileNet, 0) ?>
+                    </div>
+                    <a class="btn btn-outline-sage btn-sm" href="<?= route('financial_profile') ?>">Update</a>
+                </div>
+            <?php endif; ?>
+
             <form method="post" id="assessmentFinalForm">
                 <?= Csrf::field() ?>
                 <input type="hidden" name="action" value="assessment_store">
-                <input type="hidden" name="age" value="">
-                <input type="hidden" name="monthly_income" value="">
-                <input type="hidden" name="monthly_commitment" value="">
                 <input type="hidden" name="budget" value="">
-                <input type="hidden" name="household_size" value="">
                 <input type="hidden" name="preferred_location" value="">
                 <input type="hidden" name="property_type" value="Any">
                 <input type="hidden" name="smart_lighting" value="1">
@@ -828,130 +927,33 @@ if ($page === 'landing'): ?>
             <div id="advisorWizardAssessment">
                 <div class="advisor-step active" data-assessment-step="1">
                     <p class="eyebrow">Step 1</p>
-                    <h2 class="h4 fw-bold text-ink mb-3">About You</h2>
+                    <h2 class="h4 fw-bold text-ink mb-3">Your Budget</h2>
                     <div class="row g-3">
-                        <div class="col-md-3">
-                            <label class="form-label">Age</label>
-                            <input class="form-control" type="number" name="age" min="18" value="25" data-assessment-field>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label">Gross Monthly Income (RM)
-                                <span class="text-muted small">before deductions</span>
-                            </label>
-                            <input class="form-control" type="number" name="monthly_income" min="1" required placeholder="6500" data-assessment-field id="fieldGrossIncome">
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label">Monthly Commitments (RM)
-                                <span class="text-muted small">car loan, study loan, credit card, etc.</span>
-                            </label>
-                            <input class="form-control" type="number" name="monthly_commitment" min="0" value="0" placeholder="1200" data-assessment-field id="fieldCommitment">
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label">Gaji Bersih / Net Income (RM)
-                                <span class="text-muted small">auto-calculated</span>
-                            </label>
-                            <input class="form-control bg-light fw-bold text-sage" type="number" id="fieldNetIncome" name="net_income_display" readonly placeholder="0" tabindex="-1">
-                            <div id="netIncomeWarning" class="text-danger small mt-1" style="display:none;">⚠️ Commitments exceed income — please review.</div>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label">Budget (RM)</label>
-                            <input class="form-control" type="number" name="budget" min="1" required placeholder="550000" data-assessment-field>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label">Household Size</label>
-                            <input class="form-control" type="number" name="household_size" min="1" required placeholder="3" data-assessment-field>
+                        <div class="col-md-6">
+                            <label class="form-label fw-semibold">Property Budget (RM)</label>
+                            <input class="form-control form-control-lg" type="number" name="budget" min="1"
+                                   required placeholder="550000"
+                                   value="<?= $lastBudget > 0 ? (int)$lastBudget : '' ?>"
+                                   data-assessment-field>
+                            <div class="form-text">This is the maximum price you are willing to pay for a property.</div>
                         </div>
                     </div>
                     <script>
-                        (function () {
-                            const finalForm = document.getElementById('assessmentFinalForm');
-                            const grossInput = document.getElementById('fieldGrossIncome');
-                            const commitInput = document.getElementById('fieldCommitment');
-
-                            function recalcNet() {
-                                var gross = parseFloat(grossInput.value) || 0;
-                                var commit = parseFloat(commitInput.value) || 0;
-                                var net = Math.max(0, gross - commit);
-                                
-                                var netField = document.getElementById('fieldNetIncome');
-                                if (netField) netField.value = net > 0 ? net.toFixed(0) : '';
-                                
-                                var warn = document.getElementById('netIncomeWarning');
-                                if (warn) warn.style.display = (gross > 0 && commit >= gross) ? '' : 'none';
-                                
-                                // Instant synchronization with hidden fields
-                                if (finalForm) {
-                                    const hGross = finalForm.querySelector('input[name="monthly_income"]');
-                                    const hCommit = finalForm.querySelector('input[name="monthly_commitment"]');
-                                    if (hGross) hGross.value = grossInput.value;
-                                    if (hCommit) hCommit.value = commitInput.value;
-                                }
-                            }
-
-                            if (grossInput) grossInput.addEventListener('input', recalcNet);
-                            if (commitInput) commitInput.addEventListener('input', recalcNet);
-
-                            // Dynamic Live PHP Scoring Update Logic
-                            function fetchLivePHPPreview() {
-                                if (!finalForm) return;
-                                
-                                const formData = new FormData();
-                                // Send CSRF token so the outer POST handler doesn't reject the request
-                                const csrfInput = document.querySelector('input[name="csrf_token"]');
-                                if (csrfInput) formData.append('csrf_token', csrfInput.value);
-
-                                formData.append('monthly_income', grossInput ? grossInput.value : '0');
-                                formData.append('monthly_commitment', commitInput ? commitInput.value : '0');
-                                
-                                // Safely extract input selections based on your DOM tree names/IDs
-                                formData.append('budget', document.getElementsByName('budget')[0]?.value || '0');
-                                formData.append('preferred_location', document.getElementsByName('preferred_location')[0]?.value || 'Any');
-                                formData.append('property_type', document.getElementsByName('property_type')[0]?.value || 'Any');
-                                formData.append('household_size', document.getElementsByName('household_size')[0]?.value || '1');
-                                formData.append('comfort_priority', document.getElementsByName('comfort_priority')[0]?.value || '');
-                                
-                                // Append smart home parameters
-                                ['smart_security', 'smart_lighting', 'smart_energy', 'smart_appliances'].forEach(f => {
-                                    const el = document.querySelector(`input[name="${f}"]`);
-                                    formData.append(f, el && el.checked ? '1' : '0');
-                                });
-
-                                fetch('?action=assessment_preview', {
-                                    method: 'POST',
-                                    body: formData
-                                })
-                                .then(res => res.json())
-                                .then(res => {
-                                    if (res.success && res.data) {
-                                        updatePreviewDOM(res.data);
-                                    }
-                                })
-                                .catch(err => console.error("Preview endpoint synchronization failed:", err));
-                            }
-
-                            function updatePreviewDOM(properties) {
-                                // Target badges inside your visual cards layout on step 4 preview
-                                const badges = document.querySelectorAll('.card-badge-match, .match-percentage-badge, [data-preview-match]');
-                                
-                                properties.forEach((prop, index) => {
-                                    if (badges[index]) {
-                                        badges[index].innerText = prop.match_percentage;
-                                    }
-                                });
-                            }
-
-                            // Attach step-change event listeners to buttons
-                            const stepsButtons = document.querySelectorAll('[data-wizard-next], .btn-next, .btn-sage');
-                            stepsButtons.forEach(btn => {
-                                btn.addEventListener('click', function() {
-                                    // Wait brief moment for wizard step-animations to focus on step 4 card lists
-                                    setTimeout(fetchLivePHPPreview, 100);
-                                });
+                    (function () {
+                        const finalForm = document.getElementById('assessmentFinalForm');
+                        // Sync budget visible input -> hidden budget field in the submit form
+                        const budgetVis = document.querySelector('.advisor-step[data-assessment-step="1"] input[name="budget"]');
+                        if (budgetVis && finalForm) {
+                            budgetVis.addEventListener('input', function () {
+                                const h = finalForm.querySelector('input[name="budget"]');
+                                if (h) h.value = budgetVis.value;
                             });
-
-                            recalcNet();
-                        })();
-                        </script>
+                            // Initialise on load
+                            const h = finalForm.querySelector('input[name="budget"]');
+                            if (h && budgetVis.value) h.value = budgetVis.value;
+                        }
+                    })();
+                    </script>
                 </div>
 
                 <div class="advisor-step" data-assessment-step="2">
@@ -1331,14 +1333,30 @@ elseif ($page === 'favorites'):
         </div>
     </section>
 <?php elseif ($page === 'profile'):
-    Auth::requireLogin(); $user = Auth::user(); ?>
+    Auth::requireLogin();
+    $user = run_query('SELECT * FROM users WHERE id = ? LIMIT 1', [(int) Auth::user()['id']])->fetch(); ?>
     <section class="container py-5">
         <div class="system-card p-4 p-lg-5 mx-auto" style="max-width:680px">
             <p class="eyebrow">Profile</p><h1 class="fw-bold text-sage mb-4">Edit your profile</h1>
             <form method="post" class="vstack gap-3">
                 <?= Csrf::field() ?><input type="hidden" name="action" value="profile">
-                <input class="form-control" name="full_name" required value="<?= e($user['full_name']) ?>">
-                <input class="form-control" name="phone" value="<?= e($user['phone']) ?>" placeholder="Phone">
+                <div>
+                    <label class="form-label">Full Name</label>
+                    <input class="form-control" name="full_name" required value="<?= e($user['full_name']) ?>">
+                </div>
+                <div>
+                    <label class="form-label">Phone</label>
+                    <input class="form-control" name="phone" value="<?= e($user['phone'] ?? '') ?>" placeholder="Phone">
+                </div>
+                <div>
+                    <label class="form-label">Date of Birth <span class="text-muted small">(must be 18 or older)</span></label>
+                    <input class="form-control" type="date" name="date_of_birth"
+                           max="<?= date('Y-m-d', strtotime('-18 years')) ?>"
+                           value="<?= e($user['date_of_birth'] ?? '') ?>">
+                    <?php if (!empty($user['date_of_birth'])): ?>
+                        <div class="form-text">Age: <?= (int) date_diff(new DateTime($user['date_of_birth']), new DateTime())->y ?> years old</div>
+                    <?php endif; ?>
+                </div>
                 <?php
                 $occupationOptions = [
                     'Government / Public Sector' => ['Civil Servant','Teacher / Lecturer','Doctor / Physician','Nurse','Army / Police'],
@@ -1361,6 +1379,170 @@ elseif ($page === 'favorites'):
             </form>
         </div>
     </section>
+<?php elseif ($page === 'financial_profile'):
+    Auth::requireLogin();
+    $uid = (int) Auth::user()['id'];
+    $fpUser = run_query('SELECT gross_monthly_income FROM users WHERE id = ? LIMIT 1', [$uid])->fetch();
+    $commitments = run_query(
+        'SELECT * FROM user_commitments WHERE user_id = ? ORDER BY category, created_at',
+        [$uid]
+    )->fetchAll();
+    $totalCommitment = array_sum(array_column($commitments, 'amount'));
+    $gross = (float) ($fpUser['gross_monthly_income'] ?? 0);
+    $net   = max(0, $gross - $totalCommitment);
+    $categoryLabels = [
+        'car_loan'          => 'Car Loan',
+        'study_loan'        => 'Study Loan (PTPTN etc.)',
+        'personal_loan'     => 'Personal Loan',
+        'credit_card'       => 'Credit Card',
+        'existing_mortgage' => 'Existing Mortgage / Home Loan',
+        'other'             => 'Other',
+    ];
+    ?>
+    <section class="container py-5">
+        <div class="row g-4 justify-content-center">
+
+            <!-- Gross Income Card -->
+            <div class="col-lg-5">
+                <div class="system-card p-4 h-100">
+                    <p class="eyebrow">Financial Profile</p>
+                    <h1 class="fw-bold text-sage mb-1">Your Income</h1>
+                    <p class="text-muted mb-4">Set your gross monthly income (before EPF, SOCSO, tax deductions).</p>
+                    <form method="post" class="vstack gap-3">
+                        <?= Csrf::field() ?>
+                        <input type="hidden" name="action" value="financial_profile_save">
+                        <div>
+                            <label class="form-label fw-semibold">Gross Monthly Income (RM)</label>
+                            <input class="form-control form-control-lg" type="number" name="gross_monthly_income"
+                                   min="1" step="1" required placeholder="6500"
+                                   value="<?= $gross > 0 ? (int)$gross : '' ?>">
+                            <div class="form-text">Total salary before any deductions.</div>
+                        </div>
+                        <button class="btn btn-sage">Save Income</button>
+                    </form>
+
+                    <?php if ($gross > 0): ?>
+                    <hr class="my-4">
+                    <div class="row g-3 text-center">
+                        <div class="col-4">
+                            <div class="metric-card">
+                                <span>Gross Income</span>
+                                <strong class="text-sage">RM <?= number_format($gross, 0) ?></strong>
+                            </div>
+                        </div>
+                        <div class="col-4">
+                            <div class="metric-card">
+                                <span>Total Commitments</span>
+                                <strong class="text-danger">RM <?= number_format($totalCommitment, 0) ?></strong>
+                            </div>
+                        </div>
+                        <div class="col-4">
+                            <div class="metric-card">
+                                <span>Net Income</span>
+                                <strong class="<?= $net > 0 ? 'text-sage' : 'text-danger' ?>">RM <?= number_format($net, 0) ?></strong>
+                            </div>
+                        </div>
+                    </div>
+                    <?php if ($net <= 0 && $gross > 0): ?>
+                        <div class="alert alert-danger mt-3 mb-0">
+                            <i class="fa-solid fa-triangle-exclamation me-2"></i>
+                            Your commitments exceed your income. Please review and remove some entries below.
+                        </div>
+                    <?php endif; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <!-- Commitments Card -->
+            <div class="col-lg-7">
+                <div class="system-card p-4 h-100">
+                    <h2 class="fw-bold text-ink mb-1">Monthly Commitments</h2>
+                    <p class="text-muted mb-4">List every fixed monthly payment — car loan, study loan, credit card minimum, personal loan, existing mortgage, etc.</p>
+
+                    <!-- Add commitment form -->
+                    <form method="post" class="row g-2 mb-4">
+                        <?= Csrf::field() ?>
+                        <input type="hidden" name="action" value="commitment_add">
+                        <div class="col-md-4">
+                            <input class="form-control" name="label" required placeholder="e.g. Myvi car loan"
+                                   maxlength="150">
+                        </div>
+                        <div class="col-md-3">
+                            <select class="form-select" name="category" required>
+                                <option value="">Category</option>
+                                <?php foreach ($categoryLabels as $val => $lbl): ?>
+                                    <option value="<?= e($val) ?>"><?= e($lbl) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="input-group">
+                                <span class="input-group-text">RM</span>
+                                <input class="form-control" type="number" name="amount"
+                                       min="1" step="1" required placeholder="450">
+                            </div>
+                        </div>
+                        <div class="col-md-2">
+                            <button class="btn btn-sage w-100">Add</button>
+                        </div>
+                        <div class="col-12">
+                            <div class="form-text">Enter the <strong>monthly</strong> amount you are obligated to pay.</div>
+                        </div>
+                    </form>
+
+                    <!-- Commitments list -->
+                    <?php if (!$commitments): ?>
+                        <p class="text-muted">No commitments added yet. Add one above.</p>
+                    <?php else: ?>
+                        <div class="table-responsive">
+                            <table class="table align-middle mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Description</th>
+                                        <th>Category</th>
+                                        <th class="text-end">Amount / mo</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                <?php foreach ($commitments as $c): ?>
+                                    <tr>
+                                        <td><?= e($c['label']) ?></td>
+                                        <td><span class="badge bg-light text-dark border"><?= e($categoryLabels[$c['category']] ?? $c['category']) ?></span></td>
+                                        <td class="text-end fw-semibold">RM <?= number_format((float)$c['amount'], 0) ?></td>
+                                        <td class="text-end">
+                                            <form method="post" class="d-inline">
+                                                <?= Csrf::field() ?>
+                                                <input type="hidden" name="action" value="commitment_delete">
+                                                <input type="hidden" name="commitment_id" value="<?= (int) $c['id'] ?>">
+                                                <button class="btn btn-outline-danger btn-sm"
+                                                        onclick="return confirm('Remove this commitment?')">Remove</button>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                                </tbody>
+                                <tfoot>
+                                    <tr class="table-light fw-bold">
+                                        <td colspan="2">Total Monthly Commitments</td>
+                                        <td class="text-end text-danger">RM <?= number_format($totalCommitment, 0) ?></td>
+                                        <td></td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </div>
+                    <?php endif; ?>
+
+                    <div class="mt-3 text-end">
+                        <a class="btn btn-sage" href="<?= route('assessment') ?>">
+                            <i class="fa-solid fa-wand-magic-sparkles me-2"></i>Go to Assessment
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
 <?php elseif ($page === 'admin_dashboard'):
     Auth::requireAdmin(); $stats = admin_stats(); ?>
     <section class="container py-5">
@@ -1371,10 +1553,9 @@ elseif ($page === 'favorites'):
             <?php endforeach; ?>
         </div>
         <div class="row g-3">
-            <div class="col-md-3"><a class="btn btn-outline-sage w-100" href="<?= route('admin_users') ?>">Manage Users</a></div>
-            <div class="col-md-3"><a class="btn btn-outline-sage w-100" href="<?= route('admin_properties') ?>">Manage Properties</a></div>
-            <div class="col-md-3"><a class="btn btn-outline-sage w-100" href="<?= route('admin_criteria') ?>">Criteria</a></div>
-            <div class="col-md-3"><a class="btn btn-sage w-100" href="<?= route('admin_reports') ?>">Reports</a></div>
+            <div class="col-md-4"><a class="btn btn-outline-sage w-100" href="<?= route('admin_users') ?>">Manage Users</a></div>
+            <div class="col-md-4"><a class="btn btn-outline-sage w-100" href="<?= route('admin_properties') ?>">Manage Properties</a></div>
+            <div class="col-md-4"><a class="btn btn-sage w-100" href="<?= route('admin_reports') ?>">Reports</a></div>
         </div>
     </section>
 <?php elseif ($page === 'admin_users'):
@@ -1465,9 +1646,7 @@ elseif ($page === 'favorites'):
             <?php foreach ($properties as $property): ?><tr><td><?= e(property_text($property, 'property_name', 'township')) ?><br><small class="text-muted"><?= e(property_text($property, 'type', 'property_type')) ?></small></td><td><?= e(property_text($property, 'area', 'location')) ?></td><td><?= money(property_number($property, 'median_price', 'price')) ?></td><td><?= (int) property_number($property, 'smart_readiness_score') ?> smart / <?= (int) property_number($property, 'security_score') ?> security</td><td class="text-end"><a class="btn btn-outline-sage btn-sm" href="<?= route('admin_properties', ['id' => $property['id']]) ?>">Edit</a><form method="post" class="d-inline"><?= Csrf::field() ?><input type="hidden" name="action" value="admin_property_delete"><input type="hidden" name="id" value="<?= (int) $property['id'] ?>"><button class="btn btn-outline-danger btn-sm" onclick="return confirm('Delete this property?')">Delete</button></form></td></tr><?php endforeach; ?>
         </tbody></table></div>
     </section>
-<?php elseif ($page === 'admin_criteria'):
-    Auth::requireAdmin(); $criteria = run_query('SELECT * FROM assessment_criteria ORDER BY id')->fetchAll(); ?>
-    <section class="container py-5"><div class="system-card p-4 p-lg-5"><p class="eyebrow">Admin</p><h1 class="fw-bold text-sage mb-4">Recommendation criteria</h1><form method="post" class="vstack gap-3"><?= Csrf::field() ?><input type="hidden" name="action" value="admin_criteria"><?php foreach ($criteria as $item): ?><label class="form-label fw-bold"><?= e($item['label']) ?> <span class="text-muted"><?= e($item['description']) ?></span><input class="form-control mt-2" type="number" step="0.01" name="weights[<?= e($item['criteria_key']) ?>]" value="<?= e($item['weight']) ?>"></label><?php endforeach; ?><button class="btn btn-sage">Save Criteria</button></form></div></section>
+
 <?php elseif ($page === 'admin_reports'):
     Auth::requireAdmin();
     $rows = run_query('SELECT a.*, u.full_name, COUNT(r.id) recs, MAX(r.match_percentage) best FROM assessments a JOIN users u ON u.id = a.user_id LEFT JOIN recommendations r ON r.assessment_id = a.id GROUP BY a.id ORDER BY a.created_at DESC')->fetchAll(); ?>

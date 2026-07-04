@@ -1,0 +1,20 @@
+<section class="container py-5">
+  <div class="d-flex justify-content-between align-items-end flex-wrap gap-3 mb-4">
+    <div>
+      <p class="eyebrow">Customer View</p>
+      <h1 class="fw-bold text-sage mb-0">Property Shortlist</h1>
+    </div>
+    <form class="d-flex flex-wrap gap-2" data-property-filter-form data-property-target="customer">
+      <input class="form-control" name="area" placeholder="Preferred area" style="max-width: 180px">
+      <input class="form-control" name="budget" type="number" min="0" placeholder="Budget" style="max-width: 160px">
+      <input class="form-control" name="bedrooms" type="number" min="0" placeholder="Beds" style="max-width: 100px">
+      <button class="btn btn-sage" type="submit">Search</button>
+    </form>
+  </div>
+
+  <div class="row g-4" data-property-customer-cards>
+    <div class="col-12 text-muted">Loading properties...</div>
+  </div>
+</section>
+
+<script src="assets/js/property-components.js" defer></script>
