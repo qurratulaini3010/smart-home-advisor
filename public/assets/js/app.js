@@ -82,6 +82,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function slidersToAssessmentFields(formData) {
     const smart = Number(formData.get("smart_priority_slider") ?? 50);
     const security = Number(formData.get("security_priority_slider") ?? 50);
+    const sustainability = Number(formData.get("sustainability_priority_slider") ?? 50);
     const family = Number(formData.get("family_priority_slider") ?? 70);
     const quiet = Number(formData.get("quiet_priority_slider") ?? 50);
 
@@ -90,9 +91,20 @@ document.addEventListener("DOMContentLoaded", () => {
     formData.set("smart_energy", smart >= 50 ? "1" : "0");
     formData.set("smart_security", security >= 50 ? "1" : "0");
 
-    if (family >= 60) formData.set("comfort_priority", "Family growth");
-    else if (quiet >= 60) formData.set("comfort_priority", "Acoustic comfort");
-    else formData.set("comfort_priority", "Energy efficiency");
+    // FIX (input/output audit): sustainability_priority_slider was collected
+    // (data-assessment-field) but never read anywhere — moving it changed
+    // nothing. It now competes with family/quiet for the single
+    // comfort_priority bonus RecommendationEngine.score() grants, so the
+    // highest-weighted comfort preference (family growth, energy efficiency,
+    // or acoustic comfort) actually wins, instead of "Energy efficiency"
+    // always winning by default whenever family/quiet were both under 60.
+    const candidates = [
+      { name: "Family growth", value: family },
+      { name: "Energy efficiency", value: sustainability },
+      { name: "Acoustic comfort", value: quiet }
+    ];
+    const winner = candidates.reduce((best, c) => (c.value > best.value ? c : best), candidates[0]);
+    formData.set("comfort_priority", winner.value >= 60 ? winner.name : "Energy efficiency");
 
     return formData;
   }
@@ -200,7 +212,14 @@ document.addEventListener("DOMContentLoaded", () => {
       "smart_security",
       "smart_appliances",
       "smart_energy",
-      "comfort_priority"
+      "comfort_priority",
+      // FIX (input/output audit): these four were collected on Step 2 but
+      // never copied into the hidden submission form, so assessment_store
+      // never received them even though the user filled them in.
+      "tenure_preference",
+      "bedrooms",
+      "low_flood_risk",
+      "near_school"
     ];
 
     storedFields.forEach((name) => {

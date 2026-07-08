@@ -127,5 +127,62 @@ check('garbage/unmatched value is a clean no-op (no partial substring match)',
 check('empty value is a clean no-op',
     abs(envScore('') - 50.0) < 0.01);
 
+// ─────────────────────────────────────────────────────────────────────────
+// FIX (input/output audit): tenure preference, minimum bedrooms, low flood
+// risk, and near-school were collected by the assessment wizard's Step 2 but
+// previously had zero effect on scoring, saving, or ranking.
+// ─────────────────────────────────────────────────────────────────────────
+echo "\n=== Fix (I/O audit): tenure / bedrooms / flood risk / school inputs now score ===\n";
+
+function baseAssessment(array $overrides = []): array
+{
+    return array_merge([
+        'budget' => 500000, 'monthly_income' => 8000, 'monthly_commitment' => 0,
+        'smart_lighting' => 0, 'smart_security' => 0, 'smart_appliances' => 0, 'smart_energy' => 0,
+        'household_size' => 2, 'occupation' => 'Artist',
+    ], $overrides);
+}
+
+function baseProperty(array $overrides = []): array
+{
+    return array_merge([
+        'median_price' => 400000, 'security_score' => 50, 'smart_readiness_score' => 50,
+        'sustainability_score' => 50, 'family_score' => 50, 'bedrooms' => 2,
+        'tenure' => 'Freehold', 'flood_risk' => 'Low', 'distance_to_school_km' => 1.0,
+    ], $overrides);
+}
+
+// Tenure preference
+$tenureMatch    = RecommendationEngine::score(baseAssessment(['tenure_preference' => 'Freehold']), baseProperty())['family_score'];
+$tenureMismatch = RecommendationEngine::score(baseAssessment(['tenure_preference' => 'Leasehold']), baseProperty())['family_score'];
+$tenureAny      = RecommendationEngine::score(baseAssessment(['tenure_preference' => 'Any']), baseProperty())['family_score'];
+check('matching tenure preference boosts family score (+5)', abs($tenureMatch - 55.0) < 0.01);
+check('mismatched tenure preference penalises family score (-5)', abs($tenureMismatch - 45.0) < 0.01);
+check('"Any" tenure preference is a no-op', abs($tenureAny - 50.0) < 0.01);
+
+// Minimum bedrooms
+$bedroomsMet   = RecommendationEngine::score(baseAssessment(['bedrooms' => 2]), baseProperty(['bedrooms' => 3]))['family_score'];
+$bedroomsUnmet = RecommendationEngine::score(baseAssessment(['bedrooms' => 4]), baseProperty(['bedrooms' => 2]))['family_score'];
+$bedroomsUnset = RecommendationEngine::score(baseAssessment(['bedrooms' => 0]), baseProperty(['bedrooms' => 1]))['family_score'];
+check('property meeting minimum bedrooms gets a bonus (+5)', abs($bedroomsMet - 55.0) < 0.01);
+check('property below minimum bedrooms gets a penalty (-8)', abs($bedroomsUnmet - 42.0) < 0.01);
+check('bedrooms=0 (not specified) is a no-op', abs($bedroomsUnset - 50.0) < 0.01);
+
+// Low flood risk preference
+$floodLowMatch = RecommendationEngine::score(baseAssessment(['low_flood_risk' => 1]), baseProperty(['flood_risk' => 'Low']))['security_score'];
+$floodHighMismatch = RecommendationEngine::score(baseAssessment(['low_flood_risk' => 1]), baseProperty(['flood_risk' => 'High']))['security_score'];
+$floodNotRequested = RecommendationEngine::score(baseAssessment(['low_flood_risk' => 0]), baseProperty(['flood_risk' => 'High']))['security_score'];
+check('low-flood-risk preference + low-risk property boosts security (+6)', abs($floodLowMatch - 56.0) < 0.01);
+check('low-flood-risk preference + high-risk property penalises security (-6)', abs($floodHighMismatch - 44.0) < 0.01);
+check('flood risk not requested is a no-op regardless of property risk', abs($floodNotRequested - 50.0) < 0.01);
+
+// Near school preference
+$schoolClose = RecommendationEngine::score(baseAssessment(['near_school' => 1]), baseProperty(['distance_to_school_km' => 0.5]))['family_score'];
+$schoolFar   = RecommendationEngine::score(baseAssessment(['near_school' => 1]), baseProperty(['distance_to_school_km' => 10.0]))['family_score'];
+$schoolNotRequested = RecommendationEngine::score(baseAssessment(['near_school' => 0]), baseProperty(['distance_to_school_km' => 0.5]))['family_score'];
+check('near-school preference + close property boosts family score', $schoolClose > 50.0 && $schoolClose <= 60.0);
+check('near-school preference + far property is a no-op (beyond 3km cutoff)', abs($schoolFar - 50.0) < 0.01);
+check('school proximity not requested is a no-op regardless of distance', abs($schoolNotRequested - 50.0) < 0.01);
+
 echo "\n$pass passed, $fail failed.\n";
 exit($fail > 0 ? 1 : 0);

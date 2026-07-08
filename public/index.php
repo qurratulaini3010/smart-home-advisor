@@ -160,12 +160,19 @@ function save_recommendations(int $assessmentId, array $assessment): void
             try {
                 // Collect submitted wizard choices
                 $budget     = (float) ($_POST['budget'] ?? 0);
-                $income     = (float) ($_POST['monthly_income'] ?? 0);
-                $commitment = (float) ($_POST['monthly_commitment'] ?? 0);
                 $location   = $_POST['preferred_location'] ?? 'Any';
                 $propType   = $_POST['property_type'] ?? 'Any';
                 $household  = (int) ($_POST['household_size'] ?? 1);
                 $comfort    = $_POST['comfort_priority'] ?? '';
+
+                // FIX (input/output audit): tenure_preference, bedrooms, low_flood_risk,
+                // and near_school are collected on Step 2 (data-assessment-field) and were
+                // already being sent in this AJAX payload, but were never read here — the
+                // preview ignored them entirely. Now passed through to the scoring engine.
+                $tenurePreference = trim((string) ($_POST['tenure_preference'] ?? ''));
+                $minBedrooms      = (int) ($_POST['bedrooms'] ?? 0);
+                $lowFloodRisk     = !empty($_POST['low_flood_risk']) ? 1 : 0;
+                $nearSchool       = !empty($_POST['near_school']) ? 1 : 0;
 
                 $features = [
                     'smart_security'   => (int) ($_POST['smart_security']   ?? 0),
@@ -201,13 +208,30 @@ function save_recommendations(int $assessmentId, array $assessment): void
 
                 // FIX: Fetch the logged-in user's occupation so occupation-based
                 // adjustments in the engine are actually applied during preview.
+                //
+                // FIX (input/output audit): the visible wizard has no income/
+                // commitment inputs (those live on the Financial Profile page), so
+                // $_POST['monthly_income']/['monthly_commitment'] were always 0 —
+                // meaning the preview's affordability tilt silently ran on a net
+                // income of 0 no matter what the user had actually set up, and the
+                // preview could rank differently from the saved results. Pull the
+                // real gross income + commitments the same way assessment_store
+                // does, so preview and final scoring agree.
                 $previewOccupation = '';
+                $income            = 0.0;
+                $commitment        = 0.0;
                 if (Auth::check()) {
+                    $uid  = (int) Auth::user()['id'];
                     $uRow = run_query(
-                        'SELECT occupation FROM users WHERE id = ? LIMIT 1',
-                        [(int) Auth::user()['id']]
+                        'SELECT occupation, gross_monthly_income FROM users WHERE id = ? LIMIT 1',
+                        [$uid]
                     )->fetch();
                     $previewOccupation = $uRow['occupation'] ?? '';
+                    $income            = (float) ($uRow['gross_monthly_income'] ?? 0);
+                    $commitment        = (float) run_query(
+                        'SELECT COALESCE(SUM(amount),0) AS total FROM user_commitments WHERE user_id = ?',
+                        [$uid]
+                    )->fetch()['total'];
                 }
 
                 $netIncome      = max(0.0, $income - $commitment);
@@ -225,6 +249,10 @@ function save_recommendations(int $assessmentId, array $assessment): void
                     'smart_lighting'     => $features['smart_lighting'],
                     'smart_energy'       => $features['smart_energy'],
                     'smart_appliances'   => $features['smart_appliances'],
+                    'tenure_preference'  => $tenurePreference,    // FIX: collected, never read
+                    'bedrooms'           => $minBedrooms,         // FIX: collected, never read
+                    'low_flood_risk'     => $lowFloodRisk,        // FIX: collected, never read
+                    'near_school'        => $nearSchool,          // FIX: collected, never read
                 ];
 
                 $scored = [];
@@ -453,12 +481,22 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
             'smart_energy'       => in_array((string) post('smart_energy', '0'), ['1', 'on'], true) ? 1 : 0,
             'comfort_priority'   => (string) post('comfort_priority'),
             'occupation'         => $uRow['occupation'] ?? '',
+            // FIX (input/output audit): these four Step 2 fields were collected
+            // by the wizard (data-assessment-field) and even reached this far in
+            // $_POST, but were never read here, never saved, and never influenced
+            // scoring — filling them in changed nothing. Now read, persisted, and
+            // passed into save_recommendations() so RecommendationEngine::score()
+            // actually applies them (see RecommendationEngine.php).
+            'tenure_preference'  => trim((string) post('tenure_preference')),
+            'bedrooms'           => (int) post('bedrooms', 0),
+            'low_flood_risk'     => in_array((string) post('low_flood_risk', '0'), ['1', 'on'], true) ? 1 : 0,
+            'near_school'        => in_array((string) post('near_school', '0'), ['1', 'on'], true) ? 1 : 0,
         ];
 
         run_query(
             'INSERT INTO assessments
-            (user_id, age, monthly_income, monthly_commitment, budget, household_size, preferred_location, property_type, smart_lighting, smart_security, smart_appliances, smart_energy, comfort_priority)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (user_id, age, monthly_income, monthly_commitment, budget, household_size, preferred_location, property_type, smart_lighting, smart_security, smart_appliances, smart_energy, comfort_priority, tenure_preference, min_bedrooms, low_flood_risk, near_school)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [
                 $assessment['user_id'],
                 $assessment['age'],
@@ -473,6 +511,10 @@ if ($dbError === null && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 $assessment['smart_appliances'],
                 $assessment['smart_energy'],
                 $assessment['comfort_priority'],
+                $assessment['tenure_preference'] !== '' ? $assessment['tenure_preference'] : null,
+                $assessment['bedrooms'] > 0 ? $assessment['bedrooms'] : null,
+                $assessment['low_flood_risk'],
+                $assessment['near_school'],
             ]
         );
         $assessmentId = (int) Database::connect()->lastInsertId();
@@ -1089,6 +1131,35 @@ if ($page === 'landing'): ?>
             </div>
             <?php endif; ?>
         </div>
+
+        <?php
+        // Home preferences used for ranking — these fields (Step 2 of the
+        // wizard) now actually influence the family/security scores above,
+        // so surface what was applied for transparency.
+        $prefChips = [];
+        if (!empty($assessment['tenure_preference']) && strcasecmp($assessment['tenure_preference'], 'Any') !== 0) {
+            $prefChips[] = 'Tenure: ' . $assessment['tenure_preference'];
+        }
+        if (!empty($assessment['min_bedrooms'])) {
+            $prefChips[] = (int) $assessment['min_bedrooms'] . '+ bedrooms';
+        }
+        if (!empty($assessment['low_flood_risk'])) {
+            $prefChips[] = 'Low flood risk preferred';
+        }
+        if (!empty($assessment['near_school'])) {
+            $prefChips[] = 'Within 3km of a school';
+        }
+        ?>
+        <?php if ($prefChips): ?>
+        <div class="system-card p-3 mb-4">
+            <p class="eyebrow mb-2">Home Preferences Used for Ranking</p>
+            <div class="d-flex flex-wrap gap-2">
+                <?php foreach ($prefChips as $chip): ?>
+                    <span class="badge text-bg-light border"><?= e($chip) ?></span>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
 
         <div class="row g-4">
             <?php foreach ($rows as $row): ?>

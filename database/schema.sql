@@ -11,10 +11,33 @@ CREATE TABLE users (
   password VARCHAR(255) NOT NULL,
   phone VARCHAR(30),
   occupation VARCHAR(150),
+  date_of_birth DATE NULL,
+  gross_monthly_income DECIMAL(12,2) NULL,
   role ENUM('admin','user') NOT NULL DEFAULT 'user',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_users_role (role)
+) ENGINE=InnoDB;
+
+-- Itemised monthly commitments table. Each row is one commitment line
+-- belonging to a user; total_commitment is SUM(amount) over their rows.
+CREATE TABLE user_commitments (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  user_id      INT NOT NULL,
+  label        VARCHAR(150) NOT NULL,
+  category     ENUM(
+                 'car_loan',
+                 'study_loan',
+                 'personal_loan',
+                 'credit_card',
+                 'existing_mortgage',
+                 'other'
+               ) NOT NULL DEFAULT 'other',
+  amount       DECIMAL(12,2) NOT NULL DEFAULT 0,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_uc_user (user_id)
 ) ENGINE=InnoDB;
 
 CREATE TABLE properties (
@@ -61,6 +84,10 @@ CREATE TABLE assessments (
   household_size INT NOT NULL,
   preferred_location VARCHAR(255),
   property_type VARCHAR(100),
+  tenure_preference VARCHAR(80),
+  min_bedrooms INT,
+  low_flood_risk TINYINT(1) NOT NULL DEFAULT 0,
+  near_school TINYINT(1) NOT NULL DEFAULT 0,
   smart_lighting TINYINT(1) NOT NULL DEFAULT 0,
   smart_security TINYINT(1) NOT NULL DEFAULT 0,
   smart_appliances TINYINT(1) NOT NULL DEFAULT 0,

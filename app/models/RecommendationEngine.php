@@ -256,6 +256,51 @@ final class RecommendationEngine
             $family = max(0, $family - 10);
         }
 
+        // ── FIX (input/output audit): tenure preference, minimum bedrooms,
+        // low-flood-risk, and near-school were collected on Step 2 of the
+        // assessment wizard (data-assessment-field attributes present) and
+        // even forwarded in the live-preview AJAX payload, but neither the
+        // preview endpoint nor the final scoring engine ever read them —
+        // filling them in changed nothing. They are wired in below as soft
+        // scoring bonuses/penalties (not hard filters), consistent with how
+        // property_type/location preferences above are already handled, so a
+        // near-miss property is still shown, just ranked lower.
+        $tenurePreference = trim((string) ($assessment['tenure_preference'] ?? ''));
+        if ($tenurePreference !== '' && strcasecmp($tenurePreference, 'Any') !== 0) {
+            $propertyTenure = (string) ($property['tenure'] ?? '');
+            if ($propertyTenure !== '' && strcasecmp($tenurePreference, $propertyTenure) === 0) {
+                $family = min(100, $family + 5);
+            } elseif ($propertyTenure !== '') {
+                $family = max(0, $family - 5);
+            }
+        }
+
+        $minBedrooms = (int) ($assessment['bedrooms'] ?? 0);
+        if ($minBedrooms > 0) {
+            if ($bedrooms >= $minBedrooms) {
+                $family = min(100, $family + 5);
+            } else {
+                $family = max(0, $family - 8);
+            }
+        }
+
+        if (!empty($assessment['low_flood_risk'])) {
+            $floodRisk = strtolower((string) ($property['flood_risk'] ?? ''));
+            if (in_array($floodRisk, ['low', 'very low'], true)) {
+                $security = min(100, $security + 6);
+            } elseif (in_array($floodRisk, ['high', 'very high'], true)) {
+                $security = max(0, $security - 6);
+            }
+        }
+
+        if (!empty($assessment['near_school'])) {
+            $schoolKm = (float) ($property['distance_to_school_km'] ?? 99);
+            if ($schoolKm <= 3.0) {
+                $family = min(100, $family + max(0, min(10, 10 - $schoolKm * 2)));
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         // ── FIX (audit item #5): comfort_priority is now a closed enum ────────
         // Previously matched by str_contains() against arbitrary substrings
         // ('energy', 'security', 'family', 'growth', 'quiet', 'acoustic',
